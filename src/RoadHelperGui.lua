@@ -316,7 +316,7 @@ local function SizingPanel(props: {
 	}, {
 		LaneCountInput = e(HelpGui.WithHelpIcon, {
 			Help = e(HelpGui.BasicTooltip, {
-				HelpRichText = "Number of lanes. An odd count adds a shared center turn lane. The bounds adjust so both endpoints stay in place.",
+				HelpRichText = "Number of lanes. An odd count adds a shared center turn lane. The bounds adjust so both endpoints stay in place. On a tapered road this changes the selected end only.",
 			}),
 			LayoutOrder = 1,
 			Subject = e(NumberInput, {
@@ -331,7 +331,7 @@ local function SizingPanel(props: {
 		}),
 		LaneWidthInput = e(HelpGui.WithHelpIcon, {
 			Help = e(HelpGui.BasicTooltip, {
-				HelpRichText = "Width of each lane in studs. The bounds adjust so both endpoints stay in place.",
+				HelpRichText = "Width of each lane in studs. The bounds adjust so both endpoints stay in place. On a tapered road this changes the selected end only.",
 			}),
 			LayoutOrder = 2,
 			Subject = e(NumberInput, {
@@ -348,7 +348,7 @@ local function SizingPanel(props: {
 		}),
 		SidewalkWidthInput = e(HelpGui.WithHelpIcon, {
 			Help = e(HelpGui.BasicTooltip, {
-				HelpRichText = "Width of the raised sidewalk on each side, in studs. Zero removes the sidewalks entirely.",
+				HelpRichText = "Width of the raised sidewalk on each side, in studs. Zero removes the sidewalks entirely. On a tapered road this changes the selected end only.",
 			}),
 			LayoutOrder = 3,
 			Subject = e(NumberInput, {
@@ -392,6 +392,106 @@ local function SizingPanel(props: {
 						props.SetSizing("CornerRadius", radius)
 						return radius
 					end,
+				}),
+			})
+			else nil,
+	})
+end
+
+local function describeTaper(state: createRoadSession.SelectionState): string
+	local function studs(value: number): string
+		return string.format("%.4g", value)
+	end
+	local endWidth = (state :: any).EndWidth
+	local farWidth = (state :: any).FarEndWidth
+	local neighbourWidth = (state :: any).NeighbourWidth
+	if neighbourWidth and math.abs(neighbourWidth - endWidth) > 0.01 then
+		return `This end is <b>{studs(endWidth)}</b> studs wide, its neighbour <b>{studs(neighbourWidth)}</b>.`
+	elseif math.abs(farWidth - endWidth) > 0.01 then
+		return `Tapering from <b>{studs(endWidth)}</b> studs at this end to <b>{studs(farWidth)}</b> at the other.`
+	end
+	return `This segment is <b>{studs(endWidth)}</b> studs wide throughout.`
+end
+
+local function TaperPanel(props: {
+	SelectionState: createRoadSession.SelectionState,
+	CurrentSettings: Settings.RoadHelperSettings,
+	UpdatedSettings: () -> (),
+	TaperToNeighbour: () -> (),
+	ClearTaper: () -> (),
+	LayoutOrder: number?,
+})
+	local state = props.SelectionState
+	-- Intersections carry a lane layout per road rather than per end, so
+	-- there is nothing to taper between
+	if state.Kind == "none" or (state :: any).SegmentKind == "Intersection" then
+		return nil :: any
+	end
+	local endWidth = (state :: any).EndWidth
+	local farWidth = (state :: any).FarEndWidth
+	local neighbourWidth = (state :: any).NeighbourWidth
+	local mismatched = neighbourWidth ~= nil and math.abs(neighbourWidth - endWidth) > 0.01
+	local tapered = math.abs(farWidth - endWidth) > 0.01
+	local nextOrder = createNextOrder()
+	return e(SubPanel, {
+		Title = "Taper",
+		Padding = UDim.new(0, 6),
+		LayoutOrder = props.LayoutOrder,
+	}, {
+		AutoTaper = e(HelpGui.WithHelpIcon, {
+			Help = e(HelpGui.BasicTooltip, {
+				HelpRichText = "Dragging a road end onto a neighbour of a different width rebuilds that end to the neighbour's lane layout, so the segment widens or narrows smoothly across its length instead of stepping at the joint.",
+			}),
+			LayoutOrder = nextOrder(),
+			Subject = e(Checkbox, {
+				Label = "Auto taper",
+				Checked = props.CurrentSettings.AutoTaper,
+				Changed = function(checked: boolean)
+					props.CurrentSettings.AutoTaper = checked
+					props.UpdatedSettings()
+				end,
+			}),
+		}),
+		Widths = e("TextLabel", {
+			Size = UDim2.new(1, 0, 0, 0),
+			AutomaticSize = Enum.AutomaticSize.Y,
+			BackgroundTransparency = 1,
+			TextColor3 = Colors.OFFWHITE,
+			RichText = true,
+			Text = describeTaper(state),
+			TextWrapped = true,
+			TextXAlignment = Enum.TextXAlignment.Left,
+			Font = Enum.Font.SourceSans,
+			TextSize = 16,
+			LayoutOrder = nextOrder(),
+		}),
+		MatchButton = if mismatched
+			then e(HelpGui.WithHelpIcon, {
+				Help = e(HelpGui.BasicTooltip, {
+					HelpRichText = "Rebuilds this end to the neighbour's lane layout. Both endpoints stay put, so the joint stays sealed.",
+				}),
+				LayoutOrder = nextOrder(),
+				Subject = e(OperationButton, {
+					Text = "Taper to neighbour",
+					Height = 28,
+					Disabled = false,
+					Color = Colors.ACTION_BLUE,
+					OnClick = props.TaperToNeighbour,
+				}),
+			})
+			else nil,
+		ClearButton = if tapered
+			then e(HelpGui.WithHelpIcon, {
+				Help = e(HelpGui.BasicTooltip, {
+					HelpRichText = "Rebuilds the far end to this end's lane layout, making the segment one width again.",
+				}),
+				LayoutOrder = nextOrder(),
+				Subject = e(OperationButton, {
+					Text = "Remove taper",
+					Height = 28,
+					Disabled = false,
+					Color = Colors.ACTION_BLUE,
+					OnClick = props.ClearTaper,
 				}),
 			})
 			else nil,
@@ -663,6 +763,8 @@ local function RoadHelperGui(props: {
 	SetSegmentAttribute: (name: string, value: any) -> (),
 	SetLaneMarkings: (mode: string) -> (),
 	SetSizing: (name: string, value: number) -> (),
+	TaperToNeighbour: () -> (),
+	ClearTaper: () -> (),
 	AddSegment: (kind: RoadMath.SegmentKind) -> (),
 	AddIntersection: (throughRoad: boolean) -> (),
 	CurrentSettings: Settings.RoadHelperSettings,
@@ -705,6 +807,14 @@ local function RoadHelperGui(props: {
 		SizingPanel = e(SizingPanel, {
 			SelectionState = props.SelectionState,
 			SetSizing = props.SetSizing,
+			LayoutOrder = nextOrder(),
+		}),
+		TaperPanel = e(TaperPanel, {
+			SelectionState = props.SelectionState,
+			CurrentSettings = props.CurrentSettings,
+			UpdatedSettings = props.UpdatedSettings,
+			TaperToNeighbour = props.TaperToNeighbour,
+			ClearTaper = props.ClearTaper,
 			LayoutOrder = nextOrder(),
 		}),
 		AddPanel = e(AddPanel, {
