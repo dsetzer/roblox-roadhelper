@@ -59,6 +59,10 @@ return function(plugin: Plugin, panel: DockWidgetPluginGui, buttonClicked: Signa
 	end
 
 	local function updateUI()
+		-- Keep the session's copy of the settings it acts on current
+		if session then
+			session.SetAutoTaper(activeSettings.AutoTaper)
+		end
 		local needsUI = active or panel.Enabled
 		if needsUI then
 			if not reactRoot then
@@ -100,6 +104,16 @@ return function(plugin: Plugin, panel: DockWidgetPluginGui, buttonClicked: Signa
 				SetSizing = function(name: string, value: number)
 					if session then
 						session.SetSizing(name, value)
+					end
+				end,
+				TaperToNeighbour = function()
+					if session then
+						session.TaperToNeighbour()
+					end
+				end,
+				ClearTaper = function()
+					if session then
+						session.ClearTaper()
 					end
 				end,
 				AddSegment = function(kind: RoadMath.SegmentKind)

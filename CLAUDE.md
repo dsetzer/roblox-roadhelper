@@ -17,8 +17,11 @@ place. The core mechanic is selecting and manipulating road segment *endpoints*:
   `AdjustBlue/RedDir/Grade/Bank` attributes — both sides of a closed joint stay continuous).
 - Open endpoints additionally get three **add handles** (left turn / straight / right turn):
   click to append a new segment, click-drag to place its far endpoint following the cursor.
-- The UI panel shows the selected endpoint's angles for numeric editing, plus an Add section
-  with Straight/Curve buttons that add a segment in front of the camera.
+- Dragging an end onto a neighbour of a different width **auto tapers** it: that end is
+  rebuilt to the neighbour's lane layout, so the segment transitions between the two widths
+  instead of stepping at the joint.
+- The UI panel shows the selected endpoint's angles for numeric editing, a Taper section, plus
+  an Add section with Straight/Curve buttons that add a segment in front of the camera.
 
 ## Build Commands
 
@@ -62,10 +65,13 @@ lazy-loads `src/main.lua` on first activation.
   regenerates automatically when Size or attributes change. Move it with `PivotTo()`; the pivot
   is the center of the nominal bounding box that the generator works in.
 - Road width is derived: `width = LaneCount*LaneWidth + 2*SidewalkWidth`.
+- A `Taper` road is a second lane layout at its red end (`TaperLaneCount`/`TaperLaneWidth`/
+  `TaperSidewalkWidth`), so it has a blue width and a red width and blends the cross-section
+  between them; `Width` in RoadMath is the wider of the two, which is what the box must fit.
 - StraightRoad endpoints (local): blue `(∓sway, -Y/2, -Z/2)` outward -Z, red `(±sway, +Y/2, +Z/2)`
   outward +Z, where `sway = max((X - width)/2, 0)` and the sign pair mirrors with `Flip`.
-- CurveRoad endpoints (local): blue `(-X/2 + width/2, ·, -Z/2)` outward -Z, red
-  `(X/2, ·, Z/2 - width/2)` outward +X; `Flip` mirrors the climb only (blue at top when Flip).
+- CurveRoad endpoints (local): blue `(-X/2 + blueWidth/2, ·, -Z/2)` outward -Z, red
+  `(X/2, ·, Z/2 - redWidth/2)` outward +X; `Flip` mirrors the climb only (blue at top when Flip).
 - The Adjust dir/grade/bank rotations all pivot about the endpoint centre point, so endpoint
   *positions* are invariant under angle edits — only move edits Size/pivot.
 
