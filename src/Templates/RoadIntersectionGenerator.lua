@@ -1,7 +1,10 @@
 --!optimize 2
 --!native
--- Packaged copy of the ProceduralCarts RoadIntersection generator, used by
--- RoadHelper as a fallback template when a place has no intersections yet.
+-- The RoadIntersection generator RoadHelper builds every intersection with. A
+-- generator is a child ModuleScript of each segment, so a place holds one copy
+-- per road and nothing ever updates them; this is the copy that is maintained,
+-- and the one new segments (and "Update generator") install. Originally a copy
+-- of the ProceduralCarts RoadIntersection generator.
 
 type GenerationFunctionParams<Attributes> = {
 	Attributes: Attributes,

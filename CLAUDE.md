@@ -60,6 +60,12 @@ lazy-loads `src/main.lua` on first activation.
   - `EndpointRotateHandles.lua` — arc handles editing Adjust angles (adapted from Redupe).
   - `AddHandles.lua` — left/straight/right segment-append handles on open endpoints.
 - `src/Dragger/` — handle view components (arrows/arcs) carried over from Redupe.
+- `src/Templates/` — the road generators themselves. Every segment RoadHelper creates gets a
+  copy of these (a generator is a child ModuleScript of each segment), so the plugin can rely
+  on the features it writes being understood; the *look* still comes from the segment being
+  extended, whose attributes are copied on before the new model is parented so it generates
+  once, already correct. A segment made by hand carries its own module, which the Taper
+  panel's "Update generator" swaps for the packaged one.
 - `src/RoadHelperGui.lua` + `src/PluginGui/` — React settings panel and reusable components.
 
 ## Key Facts About Road Segments

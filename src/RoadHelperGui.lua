@@ -420,6 +420,7 @@ local function TaperPanel(props: {
 	TaperToNeighbour: () -> (),
 	ClearTaper: () -> (),
 	SetTaperLength: (length: number) -> (),
+	UpdateGenerator: () -> (),
 	LayoutOrder: number?,
 })
 	local state = props.SelectionState
@@ -494,6 +495,36 @@ local function TaperPanel(props: {
 					Disabled = false,
 					Color = Colors.ACTION_BLUE,
 					OnClick = props.TaperToNeighbour,
+				}),
+			})
+			else nil,
+		GeneratorNotice = if not (state :: any).GeneratorCurrent
+			then e("TextLabel", {
+				Size = UDim2.new(1, 0, 0, 0),
+				AutomaticSize = Enum.AutomaticSize.Y,
+				BackgroundTransparency = 1,
+				TextColor3 = Colors.OFFWHITE,
+				RichText = true,
+				Text = "This road carries its own generator module, which may not draw tapers.",
+				TextWrapped = true,
+				TextXAlignment = Enum.TextXAlignment.Left,
+				Font = Enum.Font.SourceSans,
+				TextSize = 15,
+				LayoutOrder = nextOrder(),
+			})
+			else nil,
+		UpdateGeneratorButton = if not (state :: any).GeneratorCurrent
+			then e(HelpGui.WithHelpIcon, {
+				Help = e(HelpGui.BasicTooltip, {
+					HelpRichText = "Puts this segment on the generator packaged with RoadHelper, replacing the module it carries. Its attributes are untouched, so the road regenerates the same — only the code drawing it changes, which is what lets tapers be drawn.",
+				}),
+				LayoutOrder = nextOrder(),
+				Subject = e(OperationButton, {
+					Text = "Update generator",
+					Height = 28,
+					Disabled = false,
+					Color = Colors.ACTION_BLUE,
+					OnClick = props.UpdateGenerator,
 				}),
 			})
 			else nil,
@@ -783,6 +814,7 @@ local function RoadHelperGui(props: {
 	TaperToNeighbour: () -> (),
 	ClearTaper: () -> (),
 	SetTaperLength: (length: number) -> (),
+	UpdateGenerator: () -> (),
 	AddSegment: (kind: RoadMath.SegmentKind) -> (),
 	AddIntersection: (throughRoad: boolean) -> (),
 	CurrentSettings: Settings.RoadHelperSettings,
@@ -834,6 +866,7 @@ local function RoadHelperGui(props: {
 			TaperToNeighbour = props.TaperToNeighbour,
 			ClearTaper = props.ClearTaper,
 			SetTaperLength = props.SetTaperLength,
+			UpdateGenerator = props.UpdateGenerator,
 			LayoutOrder = nextOrder(),
 		}),
 		AddPanel = e(AddPanel, {
