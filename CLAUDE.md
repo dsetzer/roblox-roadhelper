@@ -17,9 +17,12 @@ place. The core mechanic is selecting and manipulating road segment *endpoints*:
   `AdjustBlue/RedDir/Grade/Bank` attributes — both sides of a closed joint stay continuous).
 - Open endpoints additionally get three **add handles** (left turn / straight / right turn):
   click to append a new segment, click-drag to place its far endpoint following the cursor.
-- Dragging an end onto a neighbour of a different width **auto tapers** it: that end is
-  rebuilt to the neighbour's lane layout, so the segment transitions between the two widths
-  instead of stepping at the joint.
+- Dragging an end onto a neighbour of a different width **auto tapers** it: that end takes the
+  neighbour's lane layout and transitions back to the segment's own width over the taper
+  length, instead of stepping at the joint.
+- Selected endpoints also get **width handles** (widen/narrow the segment in whole lanes; ends
+  joined to neighbours auto taper back to them, so the neighbours don't move) and a **taper
+  length handle** on a tapering end (drag along the road to set how far the transition runs).
 - The UI panel shows the selected endpoint's angles for numeric editing, a Taper section, plus
   an Add section with Straight/Curve buttons that add a segment in front of the camera.
 
@@ -57,6 +60,12 @@ lazy-loads `src/main.lua` on first activation.
   - `EndpointRotateHandles.lua` — arc handles editing Adjust angles (adapted from Redupe).
   - `AddHandles.lua` — left/straight/right segment-append handles on open endpoints.
 - `src/Dragger/` — handle view components (arrows/arcs) carried over from Redupe.
+- `src/Templates/` — the road generators themselves. Every segment RoadHelper creates gets a
+  copy of these (a generator is a child ModuleScript of each segment), so the plugin can rely
+  on the features it writes being understood; the *look* still comes from the segment being
+  extended, whose attributes are copied on before the new model is parented so it generates
+  once, already correct. A segment made by hand carries its own module, which the Taper
+  panel's "Update generator" swaps for the packaged one.
 - `src/RoadHelperGui.lua` + `src/PluginGui/` — React settings panel and reusable components.
 
 ## Key Facts About Road Segments
@@ -65,9 +74,13 @@ lazy-loads `src/main.lua` on first activation.
   regenerates automatically when Size or attributes change. Move it with `PivotTo()`; the pivot
   is the center of the nominal bounding box that the generator works in.
 - Road width is derived: `width = LaneCount*LaneWidth + 2*SidewalkWidth`.
-- A `Taper` road is a second lane layout at its red end (`TaperLaneCount`/`TaperLaneWidth`/
-  `TaperSidewalkWidth`), so it has a blue width and a red width and blends the cross-section
-  between them; `Width` in RoadMath is the wider of the two, which is what the box must fit.
+- Either END may taper: `TaperBlue`/`TaperRed` turn on a lane layout of that end's own
+  (`TaperBlueLaneCount`/`LaneWidth`/`SidewalkWidth`, zero meaning "same as the road"), reached
+  over the last `TaperBlueLength` studs. The plain `LaneCount`/`LaneWidth`/`SidewalkWidth`
+  attributes stay the segment's OWN width and are never rewritten to express a taper, so a
+  taper can't read as a resize of the whole road. `Width` in RoadMath is the widest
+  cross-section anywhere, which is what the box must fit; `BaseWidth`/`BlueWidth`/`RedWidth`
+  are the road's own and each end's.
 - StraightRoad endpoints (local): blue `(∓sway, -Y/2, -Z/2)` outward -Z, red `(±sway, +Y/2, +Z/2)`
   outward +Z, where `sway = max((X - width)/2, 0)` and the sign pair mirrors with `Flip`.
 - CurveRoad endpoints (local): blue `(-X/2 + blueWidth/2, ·, -Z/2)` outward -Z, red

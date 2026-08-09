@@ -116,6 +116,16 @@ return function(plugin: Plugin, panel: DockWidgetPluginGui, buttonClicked: Signa
 						session.ClearTaper()
 					end
 				end,
+				SetTaperLength = function(length: number)
+					if session then
+						session.SetTaperLength(length)
+					end
+				end,
+				UpdateGenerator = function()
+					if session then
+						session.UpdateGenerator()
+					end
+				end,
 				AddSegment = function(kind: RoadMath.SegmentKind)
 					if session then
 						local preset = Presets.ByKey[activeSettings.SelectedPreset]
