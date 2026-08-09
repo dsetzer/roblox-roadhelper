@@ -36,6 +36,7 @@ local PartialRotateHandleView = require("./Dragger/PartialRotateHandleView")
 local EndpointMoveHandles = require("./Handles/EndpointMoveHandles")
 local EndpointRotateHandles = require("./Handles/EndpointRotateHandles")
 local AddHandles = require("./Handles/AddHandles")
+local TaperHandles = require("./Handles/TaperHandles")
 
 local REFRESH_INTERVAL = 0.25
 local JOINT_SEARCH_RADIUS = 10
@@ -68,11 +69,14 @@ export type SelectionState = {
 	LaneCount: number,
 	LaneWidth: number,
 	SidewalkWidth: number,
-	-- Road width at the selected end, at the far end of the same segment, and
-	-- at the joined neighbour's end (nil when the endpoint is open)
+	-- Road width at the selected end, the segment's own width, and the width
+	-- of the joined neighbour's end (nil when the endpoint is open)
 	EndWidth: number,
-	FarEndWidth: number,
+	SegmentWidth: number,
 	NeighbourWidth: number?,
+	-- Whether the selected end tapers, and over how many studs
+	EndTapered: boolean,
+	TaperLength: number,
 	IntersectionAngle: number,
 	-- Nominal corner curve radius of an intersection (half the bounding box
 	-- size in excess of the roads' widths and crosswalks; exact at 90 degrees)
@@ -177,10 +181,16 @@ local GEOMETRY_ATTRIBUTES = {
 	Flip = true,
 	-- A taper belongs to the transition it was built for, never to the next
 	-- segment along
-	Taper = true,
-	TaperLaneCount = true,
-	TaperLaneWidth = true,
-	TaperSidewalkWidth = true,
+	TaperBlue = true,
+	TaperBlueLaneCount = true,
+	TaperBlueLaneWidth = true,
+	TaperBlueSidewalkWidth = true,
+	TaperBlueLength = true,
+	TaperRed = true,
+	TaperRedLaneCount = true,
+	TaperRedLaneWidth = true,
+	TaperRedSidewalkWidth = true,
+	TaperRedLength = true,
 	AdjustBlueDir = true,
 	AdjustBlueGrade = true,
 	AdjustBlueBank = true,
@@ -646,11 +656,6 @@ local function createRoadSession(plugin: Plugin)
 	-- between the two instead of stepping. Off, ends just butt together.
 	local autoTaper = true
 
-	-- The lane layout attributes for a road built to one layout at both ends
-	local function uniformLayoutAttributes(layout: RoadMath.LaneLayout): { [string]: any }
-		return RoadMath.taperAttributes(layout, layout)
-	end
-
 	local function setLayoutAttributes(model: Model, attributes: { [string]: any })
 		for name, value in attributes do
 			if model:GetAttribute(name) ~= value then
@@ -671,7 +676,7 @@ local function createRoadSession(plugin: Plugin)
 		local ok, source = pcall(function()
 			return ((model :: any).Generator :: ModuleScript).Source
 		end)
-		if ok and typeof(source) == "string" and not string.find(source, "Taper", 1, true) then
+		if ok and typeof(source) == "string" and not string.find(source, "TaperBlue", 1, true) then
 			warnedAboutGenerator = true
 			warn("RoadHelper: this road's generator doesn't know the Taper attributes, so the "
 				.. "width transition won't be drawn. Update the place's StraightRoadGenerator "
@@ -681,18 +686,29 @@ local function createRoadSession(plugin: Plugin)
 
 	local function setTaperAttributes(model: Model, attributes: { [string]: any })
 		setLayoutAttributes(model, attributes)
-		if attributes.Taper then
+		if attributes.TaperBlue or attributes.TaperRed then
 			warnIfGeneratorLacksTaper(model)
 		end
 	end
 
-	-- The lane layout attributes of a segment as they stand
-	local function captureLayout(model: Model): { [string]: any }?
+	-- A segment's tapers as they stand, for restoring them when a drag moves
+	-- back off the neighbour that caused one
+	local function captureTaper(model: Model): { [string]: any }?
 		local info = RoadMath.getSegmentInfo(model)
 		if not info or info.Kind == "Intersection" then
 			return nil
 		end
-		return RoadMath.taperAttributes(RoadMath.endLayout(info, "Blue"), RoadMath.endLayout(info, "Red"))
+		local captured: { [string]: any } = {}
+		for _, prefix in RoadMath.TAPER_ATTRIBUTE_PREFIXES do
+			captured[prefix] = model:GetAttribute(prefix) == true
+			for _, suffix in { "LaneCount", "LaneWidth", "SidewalkWidth", "Length" } do
+				local value = model:GetAttribute(prefix .. suffix)
+				if value ~= nil then
+					captured[prefix .. suffix] = value
+				end
+			end
+		end
+		return captured
 	end
 
 	-- Rebuild one end of a road to `layout`, compensating the bounds so both
@@ -708,12 +724,61 @@ local function createRoadSession(plugin: Plugin)
 		local solution = RoadMath.solveWidthChange(
 			info,
 			if id == "Blue" then RoadMath.layoutWidth(layout) else RoadMath.endWidth(info, "Blue"),
-			if id == "Red" then RoadMath.layoutWidth(layout) else RoadMath.endWidth(info, "Red")
+			if id == "Red" then RoadMath.layoutWidth(layout) else RoadMath.endWidth(info, "Red"),
+			info.BaseWidth
 		)
 		setTaperAttributes(model, RoadMath.layoutAttributesForEnd(info, id, layout));
 		(model :: any).Size = solution.Size
 		model:PivotTo(solution.Pivot)
 		return true
+	end
+
+	--[[
+		Change the segment's OWN width, keeping it connected: every end joined
+		to a neighbour tapers back to that neighbour's layout, so the road
+		transitions instead of the neighbours having to change too. Both
+		endpoints stay exactly where they are.
+	]]
+	local function setSegmentLayout(model: Model, layout: RoadMath.LaneLayout)
+		local info = RoadMath.getSegmentInfo(model)
+		if not info or info.Kind == "Intersection" then
+			return
+		end
+		-- Neighbours are read before the change, so the tapers target the
+		-- widths they had rather than anything we have just written
+		local neighbours: { [string]: RoadMath.LaneLayout } = {}
+		for _, id in { "Blue", "Red" } do
+			local endpoint = RoadMath.getEndpoint(info, id :: RoadMath.EndpointId)
+			local partner = partnerOfEndpoint(endpoint)
+			if partner then
+				neighbours[id] = RoadMath.endLayout(partner.Segment, partner.Id)
+			end
+		end
+
+		setLayoutAttributes(model, RoadMath.uniformLayoutAttributes(layout))
+		for id, neighbourLayout in neighbours do
+			local current = RoadMath.getSegmentInfo(model)
+			if current then
+				setTaperAttributes(
+					model,
+					RoadMath.layoutAttributesForEnd(current, id :: RoadMath.EndpointId, neighbourLayout)
+				)
+			end
+		end
+
+		-- Both endpoints keep their positions under the new cross-section
+		local updated = RoadMath.getSegmentInfo(model)
+		if not updated then
+			return
+		end
+		local solution = RoadMath.solveWidthChange(
+			info,
+			RoadMath.endWidth(updated, "Blue"),
+			RoadMath.endWidth(updated, "Red"),
+			updated.BaseWidth
+		);
+		(model :: any).Size = solution.Size
+		model:PivotTo(solution.Pivot)
 	end
 
 	-- Taper a road end to the neighbour it has just been joined to. The
@@ -781,7 +846,7 @@ local function createRoadSession(plugin: Plugin)
 	local moveOriginalAdjust: { [RoadMath.AdjustAxis]: number }? = nil
 	-- The dragged segment's lane layout as it was before any auto taper, so
 	-- that dragging back off a neighbour undoes the taper again
-	local moveOriginalLayout: { [string]: any }? = nil
+	local moveOriginalTaper: { [string]: any }? = nil
 	local moveIntersection: {
 		Model: Model,
 		StartPivot: CFrame,
@@ -792,7 +857,7 @@ local function createRoadSession(plugin: Plugin)
 	local function startMove()
 		moveTargets = {}
 		moveOriginalAdjust = nil
-		moveOriginalLayout = nil
+		moveOriginalTaper = nil
 		moveIntersection = nil
 		local selected = getSelectedEndpoint()
 		if not selected then
@@ -801,7 +866,7 @@ local function createRoadSession(plugin: Plugin)
 		table.insert(moveTargets, { Model = selected.Segment.Model, Id = selected.Id })
 		if selected.Segment.Kind ~= "Intersection" then
 			moveOriginalAdjust = captureAdjust(moveTargets[1])
-			moveOriginalLayout = captureLayout(selected.Segment.Model)
+			moveOriginalTaper = captureTaper(selected.Segment.Model)
 		end
 		local partner = getPartnerEndpoint()
 		if partner and partner.Segment.Kind == "Intersection" then
@@ -860,11 +925,11 @@ local function createRoadSession(plugin: Plugin)
 		-- Taper before solving: the bounds below are sized from the widths the
 		-- segment ends up with, so the fixed end stays put either way
 		local dragTarget = moveTargets[1]
-		if dragTarget and moveOriginalLayout then
+		if dragTarget and moveOriginalTaper then
 			if snapMate and autoTaper then
 				taperEndToMate(dragTarget, snapMate)
 			else
-				setLayoutAttributes(dragTarget.Model, moveOriginalLayout)
+				setLayoutAttributes(dragTarget.Model, moveOriginalTaper)
 			end
 		end
 		for _, target in moveTargets do
@@ -897,7 +962,7 @@ local function createRoadSession(plugin: Plugin)
 	local function endMove()
 		moveTargets = {}
 		moveOriginalAdjust = nil
-		moveOriginalLayout = nil
+		moveOriginalTaper = nil
 		moveIntersection = nil
 		finishRecording()
 		gestureActive = false
@@ -1028,7 +1093,7 @@ local function createRoadSession(plugin: Plugin)
 		-- Lane layout follows the END being extended rather than the segment
 		-- as a whole: the far end of a taper, or an intersection's per-axis
 		-- road, is a different layout than the base attributes carry.
-		setLayoutAttributes(newModel, uniformLayoutAttributes(RoadMath.endLayout(openEnd.Segment, openEnd.Id)))
+		setLayoutAttributes(newModel, RoadMath.uniformLayoutAttributes(RoadMath.endLayout(openEnd.Segment, openEnd.Id)))
 		newModel:SetAttribute("Flip", false)
 		for _, axis in ADJUST_AXES do
 			newModel:SetAttribute(RoadMath.adjustAttributeName("Blue", axis), 0)
@@ -1133,7 +1198,7 @@ local function createRoadSession(plugin: Plugin)
 	local addDragRef: EndpointRef? = nil
 	local addSourceRef: EndpointRef? = nil
 	local addDragOriginalAdjust: { [RoadMath.AdjustAxis]: number }? = nil
-	local addDragOriginalLayout: { [string]: any }? = nil
+	local addDragOriginalTaper: { [string]: any }? = nil
 	local addBeforeSelection: SelectionSnapshot = nil
 	-- Intersection adds can't resize on drag; the whole intersection (and the
 	-- source road's end with it) moves instead
@@ -1177,7 +1242,7 @@ local function createRoadSession(plugin: Plugin)
 		end
 		addDragRef = { Model = newModel, Id = farId }
 		addDragOriginalAdjust = captureAdjust(addDragRef :: any)
-		addDragOriginalLayout = captureLayout(newModel)
+		addDragOriginalTaper = captureTaper(newModel)
 		addSourceRef = { Model = selected.Segment.Model, Id = selected.Id }
 		selectedRef = addDragRef
 		changeSignal:Fire()
@@ -1216,11 +1281,11 @@ local function createRoadSession(plugin: Plugin)
 		worldPosition, snapMate = snapToOpenEndpoint(worldPosition, { ref.Model }, addSourceRef)
 		-- Taper before solving, so the bounds below are sized from the widths
 		-- the new segment ends up with
-		if addDragOriginalLayout then
+		if addDragOriginalTaper then
 			if snapMate and autoTaper then
 				taperEndToMate(ref, snapMate)
 			else
-				setLayoutAttributes(ref.Model, addDragOriginalLayout)
+				setLayoutAttributes(ref.Model, addDragOriginalTaper)
 			end
 		end
 		local info = RoadMath.getSegmentInfo(ref.Model)
@@ -1246,7 +1311,7 @@ local function createRoadSession(plugin: Plugin)
 		addDragRef = nil
 		addSourceRef = nil
 		addDragOriginalAdjust = nil
-		addDragOriginalLayout = nil
+		addDragOriginalTaper = nil
 		intersectionAdd = nil
 		if activeRecordingName then
 			pushSelectionHistory(activeRecordingName, addBeforeSelection, snapshotSelection())
@@ -1501,13 +1566,14 @@ local function createRoadSession(plugin: Plugin)
 			end
 			-- Lane layout follows the selected END: a taper's far end, or an
 			-- intersection's per-axis road, differs from the base attributes
-			setLayoutAttributes(newModel, uniformLayoutAttributes(RoadMath.endLayout(selected.Segment, selected.Id)))
+			setLayoutAttributes(newModel, RoadMath.uniformLayoutAttributes(RoadMath.endLayout(selected.Segment, selected.Id)))
 			width = RoadMath.endpointWidth(selected)
 		end
 		newModel:SetAttribute("Flip", false)
 		-- A free-standing segment is a plain one, whatever the template it
 		-- came from was transitioning between
-		newModel:SetAttribute("Taper", false)
+		newModel:SetAttribute("TaperBlue", false)
+		newModel:SetAttribute("TaperRed", false)
 		for _, axis in ADJUST_AXES do
 			newModel:SetAttribute(RoadMath.adjustAttributeName("Blue", axis), 0)
 			newModel:SetAttribute(RoadMath.adjustAttributeName("Red", axis), 0)
@@ -1694,6 +1760,35 @@ local function createRoadSession(plugin: Plugin)
 			GetRestorableExit = getRestorableExit,
 			RestoreExit = restoreExit,
 		}),
+		TaperHandles.new(draggerContext, {
+			GetEndpoint = function()
+				local endpoint = getSelectedEndpoint()
+				-- Intersections carry a lane layout per road rather than per
+				-- end, so there is nothing to taper between
+				if not endpoint or endpoint.Segment.Kind == "Intersection" then
+					return nil
+				end
+				return endpoint
+			end,
+			StartWidth = function()
+				session.StartWidthDrag()
+			end,
+			ApplyWidth = function(width: number)
+				session.ApplyWidthDrag(width)
+			end,
+			EndWidth = function()
+				session.EndWidthDrag()
+			end,
+			StartLength = function()
+				session.StartTaperLengthDrag()
+			end,
+			ApplyLength = function(length: number)
+				session.ApplyTaperLengthDrag(length)
+			end,
+			EndLength = function()
+				session.EndTaperLengthDrag()
+			end,
+		}),
 		AddHandles.new(draggerContext, {
 			GetOpenEndpoint = function()
 				local endpoint = getSelectedEndpoint()
@@ -1825,7 +1920,6 @@ local function createRoadSession(plugin: Plugin)
 		end
 		local partner = getPartnerEndpoint()
 		local layout = RoadMath.endLayout(selected.Segment, selected.Id)
-		local farId: RoadMath.EndpointId = if selected.Id == "Blue" then "Red" else "Blue"
 		return {
 			Kind = if partner then "closed" else "open",
 			SegmentKind = selected.Segment.Kind,
@@ -1844,10 +1938,13 @@ local function createRoadSession(plugin: Plugin)
 			LaneWidth = layout.LaneWidth,
 			SidewalkWidth = layout.SidewalkWidth,
 			EndWidth = RoadMath.endpointWidth(selected),
-			FarEndWidth = if selected.Segment.Kind == "Intersection"
-				then RoadMath.endpointWidth(selected)
-				else RoadMath.endWidth(selected.Segment, farId),
+			SegmentWidth = selected.Segment.BaseWidth or selected.Segment.Width,
 			NeighbourWidth = if partner then RoadMath.endpointWidth(partner) else nil,
+			EndTapered = RoadMath.isEndTapered(selected.Segment, selected.Id),
+			TaperLength = select(
+				if selected.Id == "Blue" then 1 else 2,
+				RoadMath.taperLengths(selected.Segment)
+			),
 			IntersectionAngle = (selected.Segment.Model:GetAttribute("IntersectionAngle") :: number?) or 90,
 			CornerRadius = math.round((selected.Segment.Size.X - selected.Segment.Width
 				- 2 * ((selected.Segment.Model:GetAttribute("CrossingWidth") :: number?) or 0)) * 50) / 100,
@@ -1953,10 +2050,10 @@ local function createRoadSession(plugin: Plugin)
 			changeSignal:Fire()
 			return
 		end
-		-- On a tapered road the panel edits the END that is selected, leaving
-		-- the transition to the other end intact; an untapered road has one
-		-- layout, so both ends move together.
-		local tapered = RoadMath.isTapered(selected.Segment)
+		-- The panel edits the selected END when that end tapers, so the
+		-- transition to the rest of the road is left intact. Otherwise it
+		-- changes the segment's own width, and any ends joined to neighbours
+		-- of the old width taper back to them.
 		local layout = RoadMath.endLayout(selected.Segment, selected.Id)
 		if name == "LaneCount" then
 			layout.LaneCount = value
@@ -1968,13 +2065,10 @@ local function createRoadSession(plugin: Plugin)
 			return
 		end
 		beginRecording("Resize Road")
-		if tapered then
+		if RoadMath.isEndTapered(selected.Segment, selected.Id) then
 			applyEndLayout(model, selected.Id, layout)
 		else
-			local solution = RoadMath.solveWidthChange(selected.Segment, RoadMath.layoutWidth(layout))
-			setLayoutAttributes(model, uniformLayoutAttributes(layout));
-			(model :: any).Size = solution.Size
-			model:PivotTo(solution.Pivot)
+			setSegmentLayout(model, layout)
 		end
 		finishRecording()
 		updateDragger()
@@ -2001,18 +2095,36 @@ local function createRoadSession(plugin: Plugin)
 		changeSignal:Fire()
 	end
 
-	-- Drop a segment's taper: both ends go back to the selected end's layout.
+	-- Drop the selected end's taper: it goes back to the segment's own width.
 	function session.ClearTaper()
 		local selected = getSelectedEndpoint()
 		if not selected or selected.Segment.Kind == "Intersection" then
 			return
 		end
-		local otherId: RoadMath.EndpointId = if selected.Id == "Blue" then "Red" else "Blue"
 		beginRecording("Clear Taper")
 		applyEndLayout(
 			selected.Segment.Model,
-			otherId,
-			RoadMath.endLayout(selected.Segment, selected.Id)
+			selected.Id,
+			RoadMath.baseLayout(selected.Segment, selected.Id)
+		)
+		finishRecording()
+		updateDragger()
+		changeSignal:Fire()
+	end
+
+	-- Set the selected end's taper length from the panel
+	function session.SetTaperLength(length: number)
+		local selected = getSelectedEndpoint()
+		if not selected
+			or selected.Segment.Kind == "Intersection"
+			or not RoadMath.isEndTapered(selected.Segment, selected.Id)
+		then
+			return
+		end
+		beginRecording("Taper Length")
+		setLayoutAttributes(
+			selected.Segment.Model,
+			RoadMath.taperLengthAttributes(selected.Id, math.max(length, 0))
 		)
 		finishRecording()
 		updateDragger()
@@ -2021,6 +2133,94 @@ local function createRoadSession(plugin: Plugin)
 
 	function session.SetAutoTaper(enabled: boolean)
 		autoTaper = enabled
+	end
+
+	--------------------------------------------------------------------------
+	-- Width and taper-length drags (TaperHandles)
+	--------------------------------------------------------------------------
+
+	local widthDragModel: Model? = nil
+	local lengthDragRef: EndpointRef? = nil
+
+	function session.StartWidthDrag()
+		local selected = getSelectedEndpoint()
+		if not selected or selected.Segment.Kind == "Intersection" then
+			return
+		end
+		widthDragModel = selected.Segment.Model
+		gestureActive = true
+		beginRecording("Resize Road")
+	end
+
+	-- Widen or narrow the segment to (about) the requested width, snapped to
+	-- whole lanes. The segment's own width changes; every end joined to a
+	-- neighbour tapers back to that neighbour, so the road stays connected
+	-- instead of the neighbours being dragged along with it.
+	function session.ApplyWidthDrag(requestedWidth: number)
+		local model = widthDragModel
+		if not model then
+			return
+		end
+		local info = RoadMath.getSegmentInfo(model)
+		if not info then
+			return
+		end
+		local base = RoadMath.baseLayout(info, "Blue")
+		local roadway = math.max(requestedWidth - 2 * base.SidewalkWidth, base.LaneWidth)
+		local laneCount = math.max(math.round(roadway / base.LaneWidth), 1)
+		if laneCount == base.LaneCount then
+			return
+		end
+		setSegmentLayout(model, {
+			LaneCount = laneCount,
+			LaneWidth = base.LaneWidth,
+			SidewalkWidth = base.SidewalkWidth,
+		})
+		changeSignal:Fire()
+	end
+
+	function session.EndWidthDrag()
+		widthDragModel = nil
+		finishRecording()
+		gestureActive = false
+		updateDragger()
+		changeSignal:Fire()
+	end
+
+	function session.StartTaperLengthDrag()
+		local selected = getSelectedEndpoint()
+		if not selected or selected.Segment.Kind == "Intersection" then
+			return
+		end
+		lengthDragRef = { Model = selected.Segment.Model, Id = selected.Id }
+		gestureActive = true
+		beginRecording("Taper Length")
+	end
+
+	function session.ApplyTaperLengthDrag(length: number)
+		local ref = lengthDragRef
+		if not ref then
+			return
+		end
+		local info = RoadMath.getSegmentInfo(ref.Model)
+		if not info or not RoadMath.isEndTapered(info, ref.Id) then
+			return
+		end
+		local clamped = math.clamp(
+			math.round(length),
+			RoadMath.MIN_TAPER_LENGTH,
+			math.max(RoadMath.segmentLength(info), RoadMath.MIN_TAPER_LENGTH)
+		)
+		setLayoutAttributes(ref.Model, RoadMath.taperLengthAttributes(ref.Id, clamped))
+		changeSignal:Fire()
+	end
+
+	function session.EndTaperLengthDrag()
+		lengthDragRef = nil
+		finishRecording()
+		gestureActive = false
+		updateDragger()
+		changeSignal:Fire()
 	end
 
 	-- Toggle the blend skirt of the selected endpoint's segment

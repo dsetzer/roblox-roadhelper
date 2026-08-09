@@ -655,33 +655,50 @@ return function(t: TestTypes.TestContext)
 		attrs.LaneCount = 4
 		attrs.LaneWidth = 20
 		attrs.SidewalkWidth = 6
-		attrs.Taper = true
-		attrs.TaperLaneCount = 2
+		attrs.TaperRed = true
+		attrs.TaperRedLaneCount = 2
 		local blue = RoadMath.endLayout(seg, "Blue")
 		t.expect(blue.LaneCount).toBe(4)
 		t.expect(RoadMath.layoutWidth(blue)).toBe(4 * 20 + 12)
-		-- Unset taper values fall back to the blue end's
+		-- Unset taper values fall back to the segment's own layout
 		local red = RoadMath.endLayout(seg, "Red")
 		t.expect(red.LaneCount).toBe(2)
 		t.expect(red.LaneWidth).toBe(20)
 		t.expect(red.SidewalkWidth).toBe(6)
-		-- Taper off means both ends read the base layout
-		attrs.Taper = false
+		-- Each end tapers independently of the other
+		attrs.TaperBlue = true
+		attrs.TaperBlueLaneCount = 6
+		t.expect(RoadMath.endLayout(seg, "Blue").LaneCount).toBe(6)
+		t.expect(RoadMath.endLayout(seg, "Red").LaneCount).toBe(2)
+		-- Switching an end's taper off returns it to the segment's own layout
+		attrs.TaperBlue = false
+		attrs.TaperRed = false
+		t.expect(RoadMath.endLayout(seg, "Blue").LaneCount).toBe(4)
 		t.expect(RoadMath.endLayout(seg, "Red").LaneCount).toBe(4)
 	end)
 
-	t.test("taperAttributes: switches Taper off when the ends agree", function()
-		local layout = { LaneCount = 2, LaneWidth = 24, SidewalkWidth = 8 }
-		local same = RoadMath.taperAttributes(layout, layout)
-		t.expect(same.Taper).toBe(false)
-		local wide = { LaneCount = 4, LaneWidth = 24, SidewalkWidth = 8 }
-		local different = RoadMath.taperAttributes(layout, wide)
-		t.expect(different.Taper).toBe(true)
-		t.expect(different.LaneCount).toBe(2)
-		t.expect(different.TaperLaneCount).toBe(4)
+	t.test("taperLengths: default to half the road and never overlap", function()
+		local seg = makeSegment("Straight", Vector3.new(WIDTH, 0, 200), CFrame.identity)
+		local attrs = (seg.Model :: any).attrs
+		t.expect(select(1, RoadMath.taperLengths(seg))).toBe(0)
+
+		-- Unset length means half the segment
+		attrs.TaperRed = true
+		attrs.TaperRedLaneCount = 4
+		local _, red = RoadMath.taperLengths(seg)
+		t.expect(red).toBe(100)
+
+		-- Two tapers asking for more than the road has are scaled to fit
+		attrs.TaperBlue = true
+		attrs.TaperBlueLaneCount = 1
+		attrs.TaperBlueLength = 300
+		attrs.TaperRedLength = 100
+		local blueLength, redLength = RoadMath.taperLengths(seg)
+		t.expect(math.abs(blueLength + redLength - 200) < 0.001).toBe(true)
+		t.expect(blueLength > redLength).toBe(true)
 	end)
 
-	t.test("layoutAttributesForEnd: retargets one end and leaves the other", function()
+	t.test("layoutAttributesForEnd: never rewrites the segment's own layout", function()
 		local seg = makeSegment("Straight", Vector3.new(WIDTH, 0, 200), CFrame.identity)
 		local attrs = (seg.Model :: any).attrs
 		attrs.LaneCount = 2
@@ -689,32 +706,44 @@ return function(t: TestTypes.TestContext)
 		attrs.SidewalkWidth = 8
 		local wide = { LaneCount = 4, LaneWidth = 24, SidewalkWidth = 8 }
 
-		local atRed = RoadMath.layoutAttributesForEnd(seg, "Red", wide)
-		t.expect(atRed.Taper).toBe(true)
-		t.expect(atRed.LaneCount).toBe(2)
-		t.expect(atRed.TaperLaneCount).toBe(4)
+		-- Whichever end is retargeted, LaneCount/LaneWidth/SidewalkWidth are
+		-- left alone: a taper must never read as a resize of the whole road
+		for _, id in { "Blue", "Red" } do
+			local prefix = RoadMath.TAPER_ATTRIBUTE_PREFIXES[id]
+			local attributes = RoadMath.layoutAttributesForEnd(seg, id :: RoadMath.EndpointId, wide)
+			t.expect(attributes.LaneCount == nil).toBe(true)
+			t.expect(attributes.LaneWidth == nil).toBe(true)
+			t.expect(attributes.SidewalkWidth == nil).toBe(true)
+			t.expect(attributes[prefix]).toBe(true)
+			t.expect(attributes[prefix .. "LaneCount"]).toBe(4)
+			-- A fresh taper gets a length proportional to the width change
+			t.expect(attributes[prefix .. "Length"] > 0).toBe(true)
+			-- ...and the other end is left entirely alone
+			local otherPrefix = RoadMath.TAPER_ATTRIBUTE_PREFIXES[if id == "Blue" then "Red" else "Blue"]
+			t.expect(attributes[otherPrefix] == nil).toBe(true)
+		end
 
-		local atBlue = RoadMath.layoutAttributesForEnd(seg, "Blue", wide)
-		t.expect(atBlue.Taper).toBe(true)
-		t.expect(atBlue.LaneCount).toBe(4)
-		t.expect(atBlue.TaperLaneCount).toBe(2)
+		-- Retargeting an end back to the segment's own layout drops the taper
+		local same = RoadMath.layoutAttributesForEnd(seg, "Red", { LaneCount = 2, LaneWidth = 24, SidewalkWidth = 8 })
+		t.expect(same.TaperRed).toBe(false)
 	end)
 
-	t.test("swappedTaperValues: the two ends' layouts trade places", function()
+	t.test("swappedTaperValues: the taper follows its geographic end", function()
 		local seg = makeTaperedSegment("Straight", Vector3.new(WIDTH, 0, 200), CFrame.identity, 64, 40)
 		local attrs = (seg.Model :: any).attrs
 		attrs.LaneCount = 2
 		attrs.LaneWidth = 24
 		attrs.SidewalkWidth = 8
-		attrs.Taper = true
-		attrs.TaperLaneCount = 1
-		attrs.TaperLaneWidth = 24
-		attrs.TaperSidewalkWidth = 8
+		attrs.TaperRed = true
+		attrs.TaperRedLaneCount = 1
+		attrs.TaperRedLength = 40
 		local swapped = RoadMath.swappedTaperValues(seg)
 		assert(swapped)
-		t.expect(swapped.LaneCount).toBe(1)
-		t.expect(swapped.TaperLaneCount).toBe(2)
-		t.expect(swapped.Taper).toBe(true)
+		-- The red end's taper becomes the blue end's, values and all
+		t.expect(swapped.TaperBlue).toBe(true)
+		t.expect(swapped.TaperBlueLaneCount).toBe(1)
+		t.expect(swapped.TaperBlueLength).toBe(40)
+		t.expect(swapped.TaperRed).toBe(false)
 		-- An untapered segment has nothing to swap
 		t.expect(RoadMath.swappedTaperValues(makeSegment("Straight", Vector3.new(WIDTH, 0, 200), CFrame.identity)) == nil).toBe(true)
 	end)

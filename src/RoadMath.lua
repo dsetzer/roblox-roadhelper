@@ -44,8 +44,9 @@ export type SegmentInfo = {
 	Size: Vector3,
 	Pivot: CFrame,
 	Flip: boolean,
-	-- Road-only fields: the width at each end. Equal unless the segment
-	-- tapers; both equal Width unless the RED end is the narrow one.
+	-- Road-only fields: the segment's own width, and the width at each end
+	-- (which differs from it where that end tapers)
+	BaseWidth: number?,
 	BlueWidth: number?,
 	RedWidth: number?,
 	-- Intersection-only fields: the X road's width, its angle from the Z
@@ -137,19 +138,27 @@ function RoadMath.getSegmentInfo(instance: Instance): SegmentInfo?
 	end
 	local laneWidth = getNumberAttribute(model, "LaneWidth", 24)
 	local laneCount = getNumberAttribute(model, "LaneCount", 2)
-	local blueWidth = laneCount * laneWidth + 2 * sidewalkWidth
-	local redWidth = blueWidth
-	if model:GetAttribute("Taper") == true then
-		-- The Taper* attributes are the red end's lane layout, each one
-		-- falling back to the blue end's when unset
-		redWidth = getNumberAttribute(model, "TaperLaneCount", laneCount)
-				* getNumberAttribute(model, "TaperLaneWidth", laneWidth)
-			+ 2 * getNumberAttribute(model, "TaperSidewalkWidth", sidewalkWidth)
+	local baseWidth = laneCount * laneWidth + 2 * sidewalkWidth
+	-- Each end may taper to a layout of its own; the plain attributes stay the
+	-- segment's own width, which is what the middle of the road is built to.
+	local function endWidthOf(prefix: string): number
+		if model:GetAttribute(prefix) ~= true then
+			return baseWidth
+		end
+		local endLaneCount = getNumberAttribute(model, prefix .. "LaneCount", 0)
+		local endLaneWidth = getNumberAttribute(model, prefix .. "LaneWidth", 0)
+		local endSidewalk = getNumberAttribute(model, prefix .. "SidewalkWidth", -1)
+		return (if endLaneCount > 0 then endLaneCount else laneCount)
+				* (if endLaneWidth > 0 then endLaneWidth else laneWidth)
+			+ 2 * (if endSidewalk >= 0 then endSidewalk else sidewalkWidth)
 	end
+	local blueWidth = endWidthOf("TaperBlue")
+	local redWidth = endWidthOf("TaperRed")
 	return {
 		Model = model,
 		Kind = kind,
-		Width = math.max(blueWidth, redWidth),
+		Width = math.max(baseWidth, blueWidth, redWidth),
+		BaseWidth = baseWidth,
 		BlueWidth = blueWidth,
 		RedWidth = redWidth,
 		Size = (model :: any).Size :: Vector3,
@@ -162,12 +171,195 @@ end
 -- Lane layouts and tapering
 --------------------------------------------------------------------------------
 
+--[[
+	A road is built to one lane layout — its own, in the plain LaneCount /
+	LaneWidth / SidewalkWidth attributes — and EACH end may additionally taper
+	to a layout of its own over the last TaperBlueLength / TaperRedLength studs
+	of the road. The naming follows the AdjustBlue*/AdjustRed* attributes.
+
+	The plain attributes are never touched to express a taper, so a taper can
+	never read as a resize of the whole segment, and a generator that doesn't
+	implement tapering still draws the road at its own width.
+]]
+
+RoadMath.TAPER_ATTRIBUTE_PREFIXES = { Blue = "TaperBlue", Red = "TaperRed" }
+
+-- How long a taper should be when RoadHelper picks the length. Real
+-- transitions run several times their width change so the edge deflects
+-- gently; the floor keeps small changes from being abrupt, and callers clamp
+-- to the road that has to fit it.
+RoadMath.TAPER_RATIO = 6
+RoadMath.MIN_TAPER_LENGTH = 16
+
 function RoadMath.layoutWidth(layout: LaneLayout): number
 	return layout.LaneCount * layout.LaneWidth + 2 * layout.SidewalkWidth
 end
 
--- The road width at one end of a segment: a tapered road is a different width
--- at each end, and an intersection's X road can differ from its Z road.
+function RoadMath.layoutsMatch(a: LaneLayout, b: LaneLayout): boolean
+	return a.LaneCount == b.LaneCount
+		and a.LaneWidth == b.LaneWidth
+		and a.SidewalkWidth == b.SidewalkWidth
+end
+
+local function taperPrefix(id: EndpointId): string?
+	return RoadMath.TAPER_ATTRIBUTE_PREFIXES[id]
+end
+
+-- The segment's own lane layout: what it is built from away from any taper,
+-- and the per-axis layout for an intersection's exits.
+function RoadMath.baseLayout(segment: SegmentInfo, id: EndpointId): LaneLayout
+	local model = segment.Model
+	local axis = ""
+	if segment.Kind == "Intersection" then
+		axis = if id == "XPlus" or id == "XMinus" then "X" else "Z"
+	end
+	return {
+		LaneCount = getNumberAttribute(model, "LaneCount" .. axis, 2),
+		LaneWidth = getNumberAttribute(model, "LaneWidth" .. axis, 24),
+		SidewalkWidth = getNumberAttribute(model, "SidewalkWidth", 8),
+	}
+end
+
+-- Whether an end tapers away from the segment's own layout
+function RoadMath.isEndTapered(segment: SegmentInfo, id: EndpointId): boolean
+	local prefix = taperPrefix(id)
+	if not prefix or segment.Kind == "Intersection" then
+		return false
+	end
+	return segment.Model:GetAttribute(prefix) == true
+end
+
+-- The lane layout one end of a segment is built from: its taper layout when
+-- that end tapers, the segment's own layout otherwise.
+function RoadMath.endLayout(segment: SegmentInfo, id: EndpointId): LaneLayout
+	local base = RoadMath.baseLayout(segment, id)
+	local prefix = taperPrefix(id)
+	if not prefix or not RoadMath.isEndTapered(segment, id) then
+		return base
+	end
+	-- Zero lane values (and a negative sidewalk width) mean "same as the road",
+	-- matching the generators: an end can taper in one respect without having
+	-- to restate the rest of its layout.
+	local model = segment.Model
+	local laneCount = getNumberAttribute(model, prefix .. "LaneCount", 0)
+	local laneWidth = getNumberAttribute(model, prefix .. "LaneWidth", 0)
+	local sidewalkWidth = getNumberAttribute(model, prefix .. "SidewalkWidth", -1)
+	return {
+		LaneCount = if laneCount > 0 then laneCount else base.LaneCount,
+		LaneWidth = if laneWidth > 0 then laneWidth else base.LaneWidth,
+		SidewalkWidth = if sidewalkWidth >= 0 then sidewalkWidth else base.SidewalkWidth,
+	}
+end
+
+-- The length of a segment along its travel direction, which taper lengths are
+-- measured against. Approximate for curves (entry run plus exit run rather
+-- than the true arc length), which is all a taper length needs.
+function RoadMath.segmentLength(segment: SegmentInfo): number
+	if segment.Kind == "Curve" then
+		return math.max(segment.Size.X - RoadMath.endWidth(segment, "Blue") / 2, 0)
+			+ math.max(segment.Size.Z - RoadMath.endWidth(segment, "Red") / 2, 0)
+	end
+	return segment.Size.Z
+end
+
+function RoadMath.defaultTaperLength(widthChange: number, available: number): number
+	local wanted = math.max(math.abs(widthChange) * RoadMath.TAPER_RATIO, RoadMath.MIN_TAPER_LENGTH)
+	return math.min(wanted, available)
+end
+
+--[[
+	How far back from an end its taper runs. Zero or unset means half the
+	segment. The two ends share the road, so their windows are scaled down to
+	fit rather than allowed to overlap and fight over the middle.
+]]
+function RoadMath.taperLengths(segment: SegmentInfo): (number, number)
+	local length = RoadMath.segmentLength(segment)
+	local function wanted(id: EndpointId): number
+		if not RoadMath.isEndTapered(segment, id) then
+			return 0
+		end
+		local prefix = taperPrefix(id) :: string
+		local value = getNumberAttribute(segment.Model, prefix .. "Length", 0)
+		return math.clamp(if value > 0 then value else length / 2, 0, length)
+	end
+	local blue, red = wanted("Blue"), wanted("Red")
+	local total = blue + red
+	if total > length and total > 0 then
+		local scale = length / total
+		blue *= scale
+		red *= scale
+	end
+	return blue, red
+end
+
+-- The attributes for a road built to one layout throughout, with no tapers
+function RoadMath.uniformLayoutAttributes(layout: LaneLayout): { [string]: any }
+	return {
+		LaneCount = layout.LaneCount,
+		LaneWidth = layout.LaneWidth,
+		SidewalkWidth = layout.SidewalkWidth,
+		TaperBlue = false,
+		TaperRed = false,
+	}
+end
+
+--[[
+	The attributes making ONE end of a road taper to `layout` while the rest of
+	the segment — and its other end — keep what they have. Only that end's
+	Taper* attributes are written.
+]]
+function RoadMath.layoutAttributesForEnd(
+	segment: SegmentInfo,
+	id: EndpointId,
+	layout: LaneLayout
+): { [string]: any }
+	local prefix = taperPrefix(id)
+	if not prefix then
+		return {}
+	end
+	local base = RoadMath.baseLayout(segment, id)
+	if RoadMath.layoutsMatch(base, layout) then
+		-- Nothing to transition to: drop the taper rather than leaving one
+		-- that tapers to the width it already is
+		return { [prefix] = false }
+	end
+	local attributes: { [string]: any } = {
+		[prefix] = true,
+		[prefix .. "LaneCount"] = layout.LaneCount,
+		[prefix .. "LaneWidth"] = layout.LaneWidth,
+		[prefix .. "SidewalkWidth"] = layout.SidewalkWidth,
+	}
+	-- A newly tapered end gets a length to suit its width change; an end that
+	-- already tapers keeps the length it has, so a hand-set one survives.
+	if not RoadMath.isEndTapered(segment, id)
+		or getNumberAttribute(segment.Model, prefix .. "Length", 0) <= 0
+	then
+		attributes[prefix .. "Length"] = RoadMath.defaultTaperLength(
+			RoadMath.layoutWidth(layout) - RoadMath.layoutWidth(base),
+			RoadMath.segmentLength(segment) / 2
+		)
+	end
+	return attributes
+end
+
+function RoadMath.taperLengthAttributes(id: EndpointId, length: number): { [string]: any }
+	local prefix = taperPrefix(id)
+	if not prefix then
+		return {}
+	end
+	return { [prefix .. "Length"] = math.max(length, 0) }
+end
+
+-- Whether the segment changes width along its length at all. Derived from the
+-- widths rather than the attributes, so it answers the question the callers
+-- actually mean: does this road transition?
+function RoadMath.isTapered(segment: SegmentInfo): boolean
+	local base = segment.BaseWidth or segment.Width
+	return RoadMath.endWidth(segment, "Blue") ~= base or RoadMath.endWidth(segment, "Red") ~= base
+end
+
+-- The road width at one end of a segment: a tapered end is built to its own
+-- layout, and an intersection's X road can differ from its Z road.
 function RoadMath.endWidth(segment: SegmentInfo, id: EndpointId): number
 	if id == "Blue" then
 		return segment.BlueWidth or segment.Width
@@ -177,105 +369,6 @@ function RoadMath.endWidth(segment: SegmentInfo, id: EndpointId): number
 		return segment.WidthX or segment.Width
 	end
 	return segment.Width
-end
-
--- The lane layout one end of a segment is built from: the Taper* attributes
--- for a tapered road's red end, the per-axis attributes for an intersection's
--- exits, and the plain ones otherwise.
-function RoadMath.endLayout(segment: SegmentInfo, id: EndpointId): LaneLayout
-	local model = segment.Model
-	if segment.Kind == "Intersection" then
-		local axis = if id == "XPlus" or id == "XMinus" then "X" else "Z"
-		return {
-			LaneCount = getNumberAttribute(model, "LaneCount" .. axis, 2),
-			LaneWidth = getNumberAttribute(model, "LaneWidth" .. axis, 24),
-			SidewalkWidth = getNumberAttribute(model, "SidewalkWidth", 8),
-		}
-	end
-	local base: LaneLayout = {
-		LaneCount = getNumberAttribute(model, "LaneCount", 2),
-		LaneWidth = getNumberAttribute(model, "LaneWidth", 24),
-		SidewalkWidth = getNumberAttribute(model, "SidewalkWidth", 8),
-	}
-	if id ~= "Red" or model:GetAttribute("Taper") ~= true then
-		return base
-	end
-	return {
-		LaneCount = getNumberAttribute(model, "TaperLaneCount", base.LaneCount),
-		LaneWidth = getNumberAttribute(model, "TaperLaneWidth", base.LaneWidth),
-		SidewalkWidth = getNumberAttribute(model, "TaperSidewalkWidth", base.SidewalkWidth),
-	}
-end
-
-function RoadMath.layoutsMatch(a: LaneLayout, b: LaneLayout): boolean
-	return a.LaneCount == b.LaneCount
-		and a.LaneWidth == b.LaneWidth
-		and a.SidewalkWidth == b.SidewalkWidth
-end
-
--- The complete set of lane-layout attributes for a road built to the given
--- layout at each end. Taper is switched off entirely when the two ends agree,
--- so an untapered road never carries a stale taper.
-function RoadMath.taperAttributes(blue: LaneLayout, red: LaneLayout): { [string]: any }
-	return {
-		LaneCount = blue.LaneCount,
-		LaneWidth = blue.LaneWidth,
-		SidewalkWidth = blue.SidewalkWidth,
-		Taper = not RoadMath.layoutsMatch(blue, red),
-		TaperLaneCount = red.LaneCount,
-		TaperLaneWidth = red.LaneWidth,
-		TaperSidewalkWidth = red.SidewalkWidth,
-	}
-end
-
--- The attributes making one end of a road adopt `layout` while the other end
--- keeps the layout it has (which is what tapers the road between them).
-function RoadMath.layoutAttributesForEnd(
-	segment: SegmentInfo,
-	id: EndpointId,
-	layout: LaneLayout
-): { [string]: any }
-	if id == "Red" then
-		return RoadMath.taperAttributes(RoadMath.endLayout(segment, "Blue"), layout)
-	end
-	return RoadMath.taperAttributes(layout, RoadMath.endLayout(segment, "Red"))
-end
-
-function RoadMath.isTapered(segment: SegmentInfo): boolean
-	return (segment.BlueWidth or segment.Width) ~= (segment.RedWidth or segment.Width)
-end
-
--- Walk up from (typically) a generated road part to the segment it belongs to
-function RoadMath.segmentFromDescendant(instance: Instance?): SegmentInfo?
-	local current = instance
-	while current and current ~= workspace and current ~= game do
-		local info = RoadMath.getSegmentInfo(current)
-		if info then
-			return info
-		end
-		current = current.Parent
-	end
-	return nil
-end
-
-function RoadMath.findSegments(root: Instance): { SegmentInfo }
-	local segments = {}
-	-- Recurse manually so we can prune: segments never contain other segments
-	-- (their contents are just the generator and generated geometry), and
-	-- BaseParts never contain them either. This keeps rescans cheap even in
-	-- places with a lot of generated road geometry.
-	local function visit(container: Instance)
-		for _, child in container:GetChildren() do
-			local info = RoadMath.getSegmentInfo(child)
-			if info then
-				table.insert(segments, info)
-			elseif not child:IsA("BasePart") then
-				visit(child)
-			end
-		end
-	end
-	visit(root)
-	return segments
 end
 
 --------------------------------------------------------------------------------
@@ -534,18 +627,23 @@ function RoadMath.swappedAdjustValues(get: (name: string) -> number): { [string]
 	}
 end
 
--- The lane-layout updates accompanying a SwapEnds solution: the base layout
--- describes the blue end and the Taper* layout the red end, so on a tapered
--- segment the two trade places along with their geographic ends. Untapered
--- segments need no updates.
+-- The taper updates accompanying a SwapEnds solution: each taper is pinned to
+-- a geographic end, so the two ends' taper attributes trade places along with
+-- their colours.
 function RoadMath.swappedTaperValues(segment: SegmentInfo): { [string]: any }?
 	if not RoadMath.isTapered(segment) then
 		return nil
 	end
-	return RoadMath.taperAttributes(
-		RoadMath.endLayout(segment, "Red"),
-		RoadMath.endLayout(segment, "Blue")
-	)
+	local model = segment.Model
+	local swapped: { [string]: any } = {}
+	for _, pair in { { "TaperBlue", "TaperRed" }, { "TaperRed", "TaperBlue" } } do
+		local from, to = pair[1], pair[2]
+		swapped[to] = model:GetAttribute(from) == true
+		for _, suffix in { "LaneCount", "LaneWidth", "SidewalkWidth", "Length" } do
+			swapped[to .. suffix] = model:GetAttribute(from .. suffix)
+		end
+	end
+	return swapped
 end
 
 --------------------------------------------------------------------------------
@@ -734,10 +832,13 @@ end
 function RoadMath.solveWidthChange(
 	segment: SegmentInfo,
 	newBlueWidth: number,
-	newRedWidth: number?
+	newRedWidth: number?,
+	newBaseWidth: number?
 ): { Size: Vector3, Pivot: CFrame }
 	local newRed = newRedWidth or newBlueWidth
-	local newMax = math.max(newBlueWidth, newRed)
+	-- The box has to fit the widest cross-section: either end, or the
+	-- segment's own width where that is wider than both
+	local newMax = math.max(newBlueWidth, newRed, newBaseWidth or 0)
 	local size = segment.Size
 	if segment.Kind == "Straight" then
 		local delta = newMax - segment.Width

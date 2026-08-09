@@ -17,13 +17,22 @@ local defaultAttributes = {
 	LaneWidth = 24,
 	LaneCount = 2,
 	SidewalkWidth = 8,
-	-- Taper builds the red end to a second lane layout and blends the
-	-- cross-section between the two ends, transitioning between roads of
+	-- Either end may taper: it is built to its own lane layout and the
+	-- cross-section blends back to the road's own over the last
+	-- TaperBlueLength / TaperRedLength studs, transitioning between roads of
 	-- differing widths.
-	Taper = false,
-	TaperLaneWidth = 24,
-	TaperLaneCount = 2,
-	TaperSidewalkWidth = 8,
+	-- Zero lane values (and a negative sidewalk width) mean "same as the road",
+	-- so an end can taper in one respect without having to restate the rest
+	TaperBlue = false,
+	TaperBlueLaneWidth = 0,
+	TaperBlueLaneCount = 0,
+	TaperBlueSidewalkWidth = -1,
+	TaperBlueLength = 0,
+	TaperRed = false,
+	TaperRedLaneWidth = 0,
+	TaperRedLaneCount = 0,
+	TaperRedSidewalkWidth = -1,
+	TaperRedLength = 0,
 	MaxAngle = 10,
 	AdjustBlueGrade = 0,
 	AdjustBlueDir = 0,
@@ -99,58 +108,98 @@ local Generator: GeneratorModuleDefinition<typeof(defaultAttributes)> = {
 		-- lanes plus the two sidewalks. An odd lane count means a shared center lane.
 		-- Lane markings are painted within the roadway, so they don't widen it.
 		--
-		-- A Taper road is built to a SECOND lane layout at its red end (the
-		-- Taper* attributes) and blends its cross-section from one to the
-		-- other along the way, so it can transition between neighbours of
-		-- differing widths.
+		-- Either end may taper: it is built to a lane layout of its own,
+		-- and the cross-section blends back to the road's own layout over
+		-- the last TaperBlue/RedLength studs. The plain attributes stay the
+		-- road's own width, so an untapered generator (or an untapered end)
+		-- draws exactly what it always did.
 		local laneWidth = attributes.LaneWidth
 		local numLanes = attributes.LaneCount
 		local sidewalkWidth = attributes.SidewalkWidth or 8
 		local width = numLanes * laneWidth + (sidewalkWidth * 2)
 
-		local endLaneWidth = laneWidth
-		local endNumLanes = numLanes
-		local endSidewalkWidth = sidewalkWidth
-		if attributes.Taper then
-			endLaneWidth = attributes.TaperLaneWidth or laneWidth
-			endNumLanes = attributes.TaperLaneCount or numLanes
-			endSidewalkWidth = if attributes.TaperSidewalkWidth ~= nil
-				then attributes.TaperSidewalkWidth
-				else sidewalkWidth
+		local function readEndLayout(prefix)
+			if attributes[prefix] ~= true then
+				return false, laneWidth, numLanes, sidewalkWidth, width
+			end
+			-- Unset (zero, or negative for the sidewalk) inherits the road's
+			local taperLaneWidth = attributes[prefix .. "LaneWidth"]
+			local taperLaneCount = attributes[prefix .. "LaneCount"]
+			local taperSidewalk = attributes[prefix .. "SidewalkWidth"]
+			local endLaneWidth = if taperLaneWidth and taperLaneWidth > 0 then taperLaneWidth else laneWidth
+			local endNumLanes = if taperLaneCount and taperLaneCount > 0 then taperLaneCount else numLanes
+			local endSidewalk = if taperSidewalk and taperSidewalk >= 0 then taperSidewalk else sidewalkWidth
+			local tapers = endLaneWidth ~= laneWidth
+				or endNumLanes ~= numLanes
+				or endSidewalk ~= sidewalkWidth
+			return tapers, endLaneWidth, endNumLanes, endSidewalk,
+				endNumLanes * endLaneWidth + (endSidewalk * 2)
 		end
-		local endWidth = endNumLanes * endLaneWidth + (endSidewalkWidth * 2)
-		local isTapered = endLaneWidth ~= laneWidth
-			or endNumLanes ~= numLanes
-			or endSidewalkWidth ~= sidewalkWidth
+		local hasBlueTaper, blueLaneWidth, blueNumLanes, blueSidewalk, blueWidth = readEndLayout("TaperBlue")
+		local hasRedTaper, redLaneWidth, redNumLanes, redSidewalk, redWidth = readEndLayout("TaperRed")
+		local isTapered = hasBlueTaper or hasRedTaper
 
 		local halfWidth = width / 2
-		local endHalfWidth = endWidth / 2
-		-- The bounding box has to fit the wider of the two ends
-		local maxWidth = math.max(width, endWidth)
+		local blueHalfWidth = blueWidth / 2
+		local redHalfWidth = redWidth / 2
+		-- The bounding box has to fit the widest cross-section anywhere
+		local maxWidth = math.max(width, blueWidth, redWidth)
 
-		-- Markings follow the end with more lanes: that structure is the one
-		-- which has to survive the whole segment, and lanes the narrowing road
-		-- edge catches up with simply pinch out along the way.
-		local markingLanes = math.max(numLanes, endNumLanes)
+		-- Markings follow the widest lane structure: that is the one which has
+		-- to survive, and lanes a narrowing road edge catches up with pinch out
+		-- along the way.
+		local markingLanes = math.max(numLanes, blueNumLanes, redNumLanes)
 		local isCenterLaneDrawn = markingLanes % 2 ~= 0
 
+		local roadLength = size.Z
+
 		--[[
-			Cross-section blend along the road. Smoothstepped rather than
-			linear so the road edges leave and arrive parallel to the road
-			instead of kinking at the joints, which is what makes a taper read
-			as a transition rather than a wedge.
+			Cross-section blend along the road.
+
+			Each taper is confined to a window running back from its own end;
+			everywhere else the road keeps its own width. That confinement is what
+			makes this a taper rather than a segment which merely happens to be two
+			different widths. The two windows are scaled down if together they would
+			overrun the road, so they meet rather than fight over the middle.
+
+			Within a window the blend is smoothstepped, so the road edge leaves and
+			arrives parallel instead of kinking at either end of the transition.
 		--]]
-		local function taperBlend(u)
-			return u * u * (3 - 2 * u)
+		local function wantedSpan(has, value)
+			if not has then
+				return 0
+			end
+			local length = if value and value > 0 then value else roadLength / 2
+			return math.clamp(length / math.max(roadLength, 1e-6), 0, 1)
+		end
+		local blueSpan = wantedSpan(hasBlueTaper, attributes.TaperBlueLength)
+		local redSpan = wantedSpan(hasRedTaper, attributes.TaperRedLength)
+		if blueSpan + redSpan > 1 then
+			local scale = 1 / (blueSpan + redSpan)
+			blueSpan *= scale
+			redSpan *= scale
+		end
+
+		local function smoothstep(t)
+			return t * t * (3 - 2 * t)
+		end
+		-- Blend a cross-section value from each end's own to the road's own
+		local function crossAt(u, baseValue, blueValue, redValue)
+			if hasBlueTaper and blueSpan > 0 and u < blueSpan then
+				return blueValue + (baseValue - blueValue) * smoothstep(u / blueSpan)
+			elseif hasRedTaper and redSpan > 0 and u > 1 - redSpan then
+				return baseValue + (redValue - baseValue) * smoothstep((u - (1 - redSpan)) / redSpan)
+			end
+			return baseValue
 		end
 		local function halfWidthAt(u)
-			return halfWidth + (endHalfWidth - halfWidth) * taperBlend(u)
+			return crossAt(u, halfWidth, blueHalfWidth, redHalfWidth)
 		end
 		local function sidewalkAt(u)
-			return sidewalkWidth + (endSidewalkWidth - sidewalkWidth) * taperBlend(u)
+			return crossAt(u, sidewalkWidth, blueSidewalk, redSidewalk)
 		end
 		local function laneWidthAt(u)
-			return laneWidth + (endLaneWidth - laneWidth) * taperBlend(u)
+			return crossAt(u, laneWidth, blueLaneWidth, redLaneWidth)
 		end
 		local function edgeLineAt(u)
 			return halfWidthAt(u) - sidewalkAt(u) - EDGE_INSET
@@ -312,12 +361,22 @@ local Generator: GeneratorModuleDefinition<typeof(defaultAttributes)> = {
 		-- a smoothstep, so d(halfWidth)/du = deltaHalfWidth * 6u(1-u); the edge
 		-- swings away from parallel and back over the length of the taper, and
 		-- that swing is a direction change like any other.
-		local taperHalfDelta = endHalfWidth - halfWidth
 		local function taperAngleAt(u)
 			if not isTapered then
 				return 0
 			end
-			return math.atan(taperHalfDelta * 6 * u * (1 - u) / totalLen)
+			-- Angle of the tapering road edge to the centreline. The window's own
+			-- length matters: a short taper deflects the edge more sharply and so
+			-- needs finer tessellation.
+			local delta, span, t
+			if hasBlueTaper and blueSpan > 0 and u < blueSpan then
+				delta, span, t = halfWidth - blueHalfWidth, blueSpan, u / blueSpan
+			elseif hasRedTaper and redSpan > 0 and u > 1 - redSpan then
+				delta, span, t = redHalfWidth - halfWidth, redSpan, (u - (1 - redSpan)) / redSpan
+			else
+				return 0
+			end
+			return math.atan(delta * 6 * t * (1 - t) / math.max(span * totalLen, 1e-6))
 		end
 
 		-- cost LUT over arc length: segmentation driven by direction change (the
@@ -750,7 +809,7 @@ local Generator: GeneratorModuleDefinition<typeof(defaultAttributes)> = {
 			local blendAngle = math.rad(attributes.BlendAngle or 30)
 			local cosA, sinA = math.cos(blendAngle), math.sin(blendAngle)
 			-- No sidewalk means no raised curb: the skirt attaches at road level instead
-			local blendTop = if math.max(sidewalkWidth, endSidewalkWidth) > 0 then hSideTop else hRoadTop
+			local blendTop = if math.max(sidewalkWidth, blueSidewalk, redSidewalk) > 0 then hSideTop else hRoadTop
 			for _, sgn in { -1, 1 } do
 				local prevAlongU, prevDownU
 				for i = 1, totalNumSegments do
@@ -840,10 +899,10 @@ local Generator: GeneratorModuleDefinition<typeof(defaultAttributes)> = {
 			end
 			local blue = Color3.fromRGB(0, 100, 255)
 			local red = Color3.fromRGB(255, 40, 40)
-			helperCube(blue, p0x - halfWidth, climbY(0), -halfZ + 2)
-			helperCube(blue, p0x + halfWidth, climbY(0), -halfZ + 2)
-			helperCube(red, p1x - endHalfWidth, climbY(1), halfZ - 2)
-			helperCube(red, p1x + endHalfWidth, climbY(1), halfZ - 2)
+			helperCube(blue, p0x - blueHalfWidth, climbY(0), -halfZ + 2)
+			helperCube(blue, p0x + blueHalfWidth, climbY(0), -halfZ + 2)
+			helperCube(red, p1x - redHalfWidth, climbY(1), halfZ - 2)
+			helperCube(red, p1x + redHalfWidth, climbY(1), halfZ - 2)
 		end
 	end,
 }
