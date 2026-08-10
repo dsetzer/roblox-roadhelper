@@ -14,10 +14,11 @@
 
 	Conventions used throughout (matching the generators):
 	- width = LaneCount*LaneWidth + 2*SidewalkWidth
-	- A Taper segment is a different width at each end: the base lane layout
-	  describes the blue end and the Taper* layout the red end, so a segment
-	  has a BlueWidth and a RedWidth. Width (the one the bounding box has to
-	  fit) is the wider of the two.
+	- A road is built to its own lane layout (the plain LaneCount / LaneWidth /
+	  SidewalkWidth attributes), and EACH end may taper to a layout of its own
+	  over the last TaperBlueLength / TaperRedLength studs. So a segment has a
+	  BaseWidth plus a BlueWidth and a RedWidth; Width (the one the bounding
+	  box has to fit) is the widest of the three.
 	- Straight: blue at local (-fs*sway, -Y/2, -Z/2) facing -Z, red at
 	  (fs*sway, +Y/2, +Z/2) facing +Z, fs = Flip and -1 or 1,
 	  sway = max((X - width)/2, 0). The road always climbs blue -> red.
@@ -165,6 +166,39 @@ function RoadMath.getSegmentInfo(instance: Instance): SegmentInfo?
 		Pivot = model:GetPivot(),
 		Flip = model:GetAttribute("Flip") == true,
 	}
+end
+
+-- Walk up from (typically) a generated road part to the segment it belongs to
+function RoadMath.segmentFromDescendant(instance: Instance?): SegmentInfo?
+	local current = instance
+	while current and current ~= workspace and current ~= game do
+		local info = RoadMath.getSegmentInfo(current)
+		if info then
+			return info
+		end
+		current = current.Parent
+	end
+	return nil
+end
+
+function RoadMath.findSegments(root: Instance): { SegmentInfo }
+	local segments = {}
+	-- Recurse manually so we can prune: segments never contain other segments
+	-- (their contents are just the generator and generated geometry), and
+	-- BaseParts never contain them either. This keeps rescans cheap even in
+	-- places with a lot of generated road geometry.
+	local function visit(container: Instance)
+		for _, child in container:GetChildren() do
+			local info = RoadMath.getSegmentInfo(child)
+			if info then
+				table.insert(segments, info)
+			elseif not child:IsA("BasePart") then
+				visit(child)
+			end
+		end
+	end
+	visit(root)
+	return segments
 end
 
 --------------------------------------------------------------------------------
