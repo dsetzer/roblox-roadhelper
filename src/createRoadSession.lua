@@ -153,17 +153,19 @@ local GENERATOR_MODULE_NAMES: { [RoadMath.SegmentKind]: string } = {
 }
 
 --[[
-	Every segment RoadHelper builds gets the generator packaged inside the
-	plugin, never a copy of some neighbour's.
+	New segments are cloned from an existing one where there is one to clone,
+	and built from the packaged generator only when the place has none of that
+	kind yet.
 
-	A generator is a child ModuleScript of each segment, so a place holds one
-	copy per road — copies which nothing ever updates. Cloning a neighbour
-	therefore spreads whatever version that neighbour happened to carry, and
-	leaves RoadHelper unable to rely on any attribute it writes being
-	understood. The plugin's copy is the one that actually gets maintained, so
-	it is the one new roads are built from; the look still comes from the road
-	being extended, whose attributes are copied onto the new model BEFORE it is
-	parented, so it generates once, already correct.
+	Cloning inherits a generator that is already loaded and running, which
+	keeps a fresh module load — and every way one can fail — off the path that
+	adding a road takes. The cost is that a clone carries whatever generator
+	version its neighbour had, so it may not implement tapering; generators
+	RoadHelper installs are stamped, and "Update generator" swaps a segment
+	onto the packaged one.
+
+	Either way the appearance attributes are copied onto the new model BEFORE
+	it is parented, so it generates once, already correct.
 ]]
 local Templates = script.Parent.Templates
 -- Stamped on generators RoadHelper installs, so a segment carrying an older
@@ -1127,7 +1129,15 @@ local function createRoadSession(plugin: Plugin)
 		local width = RoadMath.endpointWidth(openEnd)
 		local kind, joinId, pivot, size = RoadMath.placeNewSegment(openEnd, turn, width)
 
-		local newModel = createSegmentModel(kind, size)
+		-- Prefer the segment being extended (same kind), then the nearest of
+		-- that kind, and only build from the packaged generator when the place
+		-- has none at all
+		local template = if openEnd.Segment.Kind == kind
+			then openEnd.Segment
+			else findTemplate(kind, openEnd.WorldCFrame.Position)
+		local newModel = if template
+			then template.Model:Clone()
+			else createSegmentModel(kind, size)
 		if not newModel then
 			return nil, nil
 		end
@@ -1191,7 +1201,10 @@ local function createRoadSession(plugin: Plugin)
 	-- layout matching the road on both of its axes.
 	local function createJoinedIntersection(openEnd: RoadMath.Endpoint): Model?
 		local sourceModel = openEnd.Segment.Model
-		local newModel = createSegmentModel("Intersection")
+		local template = findTemplate("Intersection", openEnd.WorldCFrame.Position)
+		local newModel = if template
+			then template.Model:Clone()
+			else createSegmentModel("Intersection")
 		if not newModel then
 			return nil
 		end
@@ -1574,19 +1587,12 @@ local function createRoadSession(plugin: Plugin)
 
 		local beforeSelection = snapshotSelection()
 		beginRecording("Add Segment")
-		local newModel = createSegmentModel(kind, size)
+		local newModel = if template
+			then template.Model:Clone()
+			else createSegmentModel(kind, size)
 		if not newModel then
 			finishRecording()
 			return
-		end
-		-- The nearby segment is an appearance source only; the geometry comes
-		-- from the packaged generator
-		if template then
-			for name, value in template.Model:GetAttributes() do
-				if not GEOMETRY_ATTRIBUTES[name] then
-					newModel:SetAttribute(name, value)
-				end
-			end
 		end
 		if presetAttributes then
 			-- The preset decides the appearance outright
@@ -2331,17 +2337,12 @@ local function createRoadSession(plugin: Plugin)
 		local template = findTemplate("Intersection", target)
 		local beforeSelection = snapshotSelection()
 		beginRecording("Add Intersection")
-		local newModel = createSegmentModel("Intersection")
+		local newModel = if template
+			then template.Model:Clone()
+			else createSegmentModel("Intersection")
 		if not newModel then
 			finishRecording()
 			return
-		end
-		if template then
-			for name, value in template.Model:GetAttributes() do
-				if not GEOMETRY_ATTRIBUTES[name] then
-					newModel:SetAttribute(name, value)
-				end
-			end
 		end
 		if presetAttributes then
 			-- The preset's road lane layout maps onto both of the
