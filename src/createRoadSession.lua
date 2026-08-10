@@ -218,7 +218,7 @@ local function hasCurrentGenerator(model: Model): boolean
 	return generator:GetAttribute(GENERATOR_MARKER) == GENERATOR_VERSION
 end
 
-local function createSegmentModel(kind: RoadMath.SegmentKind): Model?
+local function createSegmentModel(kind: RoadMath.SegmentKind, size: Vector3?): Model?
 	local ok, model = pcall(function()
 		return Instance.new("ProceduralModel" :: any) :: any
 	end)
@@ -230,6 +230,12 @@ local function createSegmentModel(kind: RoadMath.SegmentKind): Model?
 		then "StraightRoad"
 		elseif kind == "Curve" then "CurveRoad"
 		else "RoadIntersection"
+	-- Size before the generator is bound: a fresh ProceduralModel carries a
+	-- default size, and binding the generator to that would have it generate
+	-- once at a shape nobody asked for before the real one is applied.
+	if size then
+		model.Size = size
+	end
 	if not installGenerator(model, kind) then
 		warn(`RoadHelper: The packaged {kind} generator is missing from the plugin.`)
 		model:Destroy()
@@ -1121,7 +1127,7 @@ local function createRoadSession(plugin: Plugin)
 		local width = RoadMath.endpointWidth(openEnd)
 		local kind, joinId, pivot, size = RoadMath.placeNewSegment(openEnd, turn, width)
 
-		local newModel = createSegmentModel(kind)
+		local newModel = createSegmentModel(kind, size)
 		if not newModel then
 			return nil, nil
 		end
@@ -1562,9 +1568,13 @@ local function createRoadSession(plugin: Plugin)
 		end
 		local rotation = CFrame.Angles(0, yaw, 0)
 
+		local size = if kind == "Straight"
+			then Vector3.new(width, 0, math.max(2 * width, RoadMath.MIN_LENGTH))
+			else Vector3.new(2 * width, 0, 2 * width)
+
 		local beforeSelection = snapshotSelection()
 		beginRecording("Add Segment")
-		local newModel = createSegmentModel(kind)
+		local newModel = createSegmentModel(kind, size)
 		if not newModel then
 			finishRecording()
 			return
@@ -1605,10 +1615,6 @@ local function createRoadSession(plugin: Plugin)
 			newModel:SetAttribute(RoadMath.adjustAttributeName("Blue", axis), 0)
 			newModel:SetAttribute(RoadMath.adjustAttributeName("Red", axis), 0)
 		end
-
-		local size = if kind == "Straight"
-			then Vector3.new(width, 0, math.max(2 * width, RoadMath.MIN_LENGTH))
-			else Vector3.new(2 * width, 0, 2 * width)
 
 		-- Center the segment on the point the camera is looking at (the pivot
 		-- is the bounding box center), rather than having it extend away out
