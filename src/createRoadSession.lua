@@ -52,6 +52,9 @@ export type EndpointRef = {
 
 export type SelectionState = {
 	Kind: "none",
+	-- Reported with no selection too, so the panel can offer the upgrade the
+	-- moment the tool opens
+	OutdatedGenerators: number,
 } | {
 	Kind: "open" | "closed",
 	SegmentKind: RoadMath.SegmentKind,
@@ -80,6 +83,8 @@ export type SelectionState = {
 	-- Whether the segment is running RoadHelper's own generator, which is what
 	-- decides whether the features the plugin writes get drawn at all
 	GeneratorCurrent: boolean,
+	-- How many segments in the place are still on an older generator
+	OutdatedGenerators: number,
 	IntersectionAngle: number,
 	-- Nominal corner curve radius of an intersection (half the bounding box
 	-- size in excess of the roads' widths and crosswalks; exact at 90 degrees)
@@ -1871,6 +1876,15 @@ local function createRoadSession(plugin: Plugin)
 		}),
 	}
 
+	-- One scan when the tool opens, deferred so it never lands inside a click
+	task.defer(function()
+		local ok, err = pcall(rescanGenerators)
+		if not ok then
+			warn("RoadHelper: Generator scan failed: " .. tostring(err))
+		end
+		changeSignal:Fire()
+	end)
+
 	local rootElement = Roact.createElement(DraggerToolComponent, {
 		Mouse = plugin:GetMouse(),
 		DraggerContext = draggerContext,
@@ -1955,7 +1969,7 @@ local function createRoadSession(plugin: Plugin)
 	function session.GetSelectionState(): SelectionState
 		local selected = getSelectedEndpoint()
 		if not selected then
-			return { Kind = "none" :: "none" }
+			return { Kind = "none" :: "none", OutdatedGenerators = outdatedGenerators }
 		end
 		local partner = getPartnerEndpoint()
 		local layout = RoadMath.endLayout(selected.Segment, selected.Id)
@@ -1981,6 +1995,7 @@ local function createRoadSession(plugin: Plugin)
 			NeighbourWidth = if partner then RoadMath.endpointWidth(partner) else nil,
 			EndTapered = RoadMath.isEndTapered(selected.Segment, selected.Id),
 			GeneratorCurrent = hasCurrentGenerator(selected.Segment.Model),
+			OutdatedGenerators = outdatedGenerators,
 			TaperLength = select(
 				if selected.Id == "Blue" then 1 else 2,
 				RoadMath.taperLengths(selected.Segment)
@@ -2171,6 +2186,49 @@ local function createRoadSession(plugin: Plugin)
 		changeSignal:Fire()
 	end
 
+	--[[
+		Roads made before the taper update carry a generator that predates it,
+		and no amount of attribute setting makes such a generator draw a taper
+		— the transition is code, not a parameter. They can't be detected by
+		reading the module (that needs script injection permission), so the
+		test is whether RoadHelper installed the generator itself: anything
+		unstamped is treated as possibly outdated and offered an upgrade.
+	]]
+	local outdatedGenerators = 0
+	local function rescanGenerators()
+		local count = 0
+		for _, segment in RoadMath.findSegments(workspace) do
+			if not hasCurrentGenerator(segment.Model) then
+				count += 1
+			end
+		end
+		outdatedGenerators = count
+	end
+
+	-- Swap every road in the place onto the packaged generator, in one
+	-- recording so the whole sweep undoes as a unit.
+	function session.UpgradeAllGenerators()
+		local outdated: { RoadMath.SegmentInfo } = {}
+		for _, segment in RoadMath.findSegments(workspace) do
+			if not hasCurrentGenerator(segment.Model) then
+				table.insert(outdated, segment)
+			end
+		end
+		if #outdated == 0 then
+			outdatedGenerators = 0
+			changeSignal:Fire()
+			return
+		end
+		beginRecording("Update Generators")
+		for _, segment in outdated do
+			replaceGenerator(segment.Model, segment.Kind)
+		end
+		finishRecording()
+		rescanGenerators()
+		updateDragger()
+		changeSignal:Fire()
+	end
+
 	-- Put the selected segment on the packaged generator, so features the
 	-- plugin writes (tapering, above all) are actually drawn.
 	function session.UpdateGenerator()
@@ -2181,6 +2239,7 @@ local function createRoadSession(plugin: Plugin)
 		beginRecording("Update Generator")
 		replaceGenerator(selected.Segment.Model, selected.Segment.Kind)
 		finishRecording()
+		rescanGenerators()
 		updateDragger()
 		changeSignal:Fire()
 	end

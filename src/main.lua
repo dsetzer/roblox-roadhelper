@@ -80,7 +80,9 @@ return function(plugin: Plugin, panel: DockWidgetPluginGui, buttonClicked: Signa
 			assert(reactRoot, "We just created it")
 			reactRoot:render(React.createElement(RoadHelperGui, {
 				GuiState = getGuiState(),
-				SelectionState = if session then session.GetSelectionState() else { Kind = "none" :: "none" },
+				SelectionState = if session
+						then session.GetSelectionState()
+						else { Kind = "none" :: "none", OutdatedGenerators = 0 },
 				SetAdjustValue = function(axis: RoadMath.AdjustAxis, value: number)
 					if session then
 						session.SetAdjustValue(axis, value)
@@ -124,6 +126,11 @@ return function(plugin: Plugin, panel: DockWidgetPluginGui, buttonClicked: Signa
 				UpdateGenerator = function()
 					if session then
 						session.UpdateGenerator()
+					end
+				end,
+				UpgradeAllGenerators = function()
+					if session then
+						session.UpgradeAllGenerators()
 					end
 				end,
 				AddSegment = function(kind: RoadMath.SegmentKind)

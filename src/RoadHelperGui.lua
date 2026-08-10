@@ -398,6 +398,15 @@ local function SizingPanel(props: {
 	})
 end
 
+local UPGRADE_ALL_HELP = "Puts every road in the place on the generator packaged with RoadHelper. Attributes are untouched, so the roads regenerate the same — only the code drawing them changes. It is one undo step, so ctrl-Z puts them all back."
+
+local function describeOutdated(count: number): string
+	if count == 1 then
+		return "<b>1 road</b> in this place was made with an older generator, which can't draw tapers."
+	end
+	return `<b>{count} roads</b> in this place were made with an older generator, which can't draw tapers.`
+end
+
 local function describeTaper(state: createRoadSession.SelectionState): string
 	local function studs(value: number): string
 		return string.format("%.4g", value)
@@ -421,12 +430,49 @@ local function TaperPanel(props: {
 	ClearTaper: () -> (),
 	SetTaperLength: (length: number) -> (),
 	UpdateGenerator: () -> (),
+	UpgradeAllGenerators: () -> (),
 	LayoutOrder: number?,
 })
 	local state = props.SelectionState
 	-- Intersections carry a lane layout per road rather than per end, so
-	-- there is nothing to taper between
+	-- there is nothing to taper between. With nothing selected the section
+	-- still appears when the place has roads needing an upgrade, since that
+	-- is the first thing worth telling the user.
 	if state.Kind == "none" or (state :: any).SegmentKind == "Intersection" then
+		if (state :: any).OutdatedGenerators and (state :: any).OutdatedGenerators > 0 then
+			return e(SubPanel, {
+				Title = "Taper",
+				Padding = UDim.new(0, 6),
+				LayoutOrder = props.LayoutOrder,
+			}, {
+				Notice = e("TextLabel", {
+					Size = UDim2.new(1, 0, 0, 0),
+					AutomaticSize = Enum.AutomaticSize.Y,
+					BackgroundTransparency = 1,
+					TextColor3 = Colors.OFFWHITE,
+					RichText = true,
+					Text = describeOutdated((state :: any).OutdatedGenerators),
+					TextWrapped = true,
+					TextXAlignment = Enum.TextXAlignment.Left,
+					Font = Enum.Font.SourceSans,
+					TextSize = 15,
+					LayoutOrder = 1,
+				}),
+				UpgradeAll = e(HelpGui.WithHelpIcon, {
+					Help = e(HelpGui.BasicTooltip, {
+						HelpRichText = UPGRADE_ALL_HELP,
+					}),
+					LayoutOrder = 2,
+					Subject = e(OperationButton, {
+						Text = `Update all {(state :: any).OutdatedGenerators} generators`,
+						Height = 28,
+						Disabled = false,
+						Color = Colors.ACTION_BLUE,
+						OnClick = props.UpgradeAllGenerators,
+					}),
+				}),
+			})
+		end
 		return nil :: any
 	end
 	local endWidth = (state :: any).EndWidth
@@ -495,6 +541,36 @@ local function TaperPanel(props: {
 					Disabled = false,
 					Color = Colors.ACTION_BLUE,
 					OnClick = props.TaperToNeighbour,
+				}),
+			})
+			else nil,
+		OutdatedNotice = if (state :: any).OutdatedGenerators > 0
+			then e("TextLabel", {
+				Size = UDim2.new(1, 0, 0, 0),
+				AutomaticSize = Enum.AutomaticSize.Y,
+				BackgroundTransparency = 1,
+				TextColor3 = Colors.OFFWHITE,
+				RichText = true,
+				Text = describeOutdated((state :: any).OutdatedGenerators),
+				TextWrapped = true,
+				TextXAlignment = Enum.TextXAlignment.Left,
+				Font = Enum.Font.SourceSans,
+				TextSize = 15,
+				LayoutOrder = nextOrder(),
+			})
+			else nil,
+		UpgradeAllButton = if (state :: any).OutdatedGenerators > 0
+			then e(HelpGui.WithHelpIcon, {
+				Help = e(HelpGui.BasicTooltip, {
+					HelpRichText = UPGRADE_ALL_HELP,
+				}),
+				LayoutOrder = nextOrder(),
+				Subject = e(OperationButton, {
+					Text = `Update all {(state :: any).OutdatedGenerators} generators`,
+					Height = 28,
+					Disabled = false,
+					Color = Colors.ACTION_BLUE,
+					OnClick = props.UpgradeAllGenerators,
 				}),
 			})
 			else nil,
@@ -815,6 +891,7 @@ local function RoadHelperGui(props: {
 	ClearTaper: () -> (),
 	SetTaperLength: (length: number) -> (),
 	UpdateGenerator: () -> (),
+	UpgradeAllGenerators: () -> (),
 	AddSegment: (kind: RoadMath.SegmentKind) -> (),
 	AddIntersection: (throughRoad: boolean) -> (),
 	CurrentSettings: Settings.RoadHelperSettings,
@@ -867,6 +944,7 @@ local function RoadHelperGui(props: {
 			ClearTaper = props.ClearTaper,
 			SetTaperLength = props.SetTaperLength,
 			UpdateGenerator = props.UpdateGenerator,
+			UpgradeAllGenerators = props.UpgradeAllGenerators,
 			LayoutOrder = nextOrder(),
 		}),
 		AddPanel = e(AddPanel, {
