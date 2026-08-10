@@ -52,9 +52,6 @@ export type EndpointRef = {
 
 export type SelectionState = {
 	Kind: "none",
-	-- Reported with no selection too, so the panel can offer the upgrade the
-	-- moment the tool opens
-	OutdatedGenerators: number,
 } | {
 	Kind: "open" | "closed",
 	SegmentKind: RoadMath.SegmentKind,
@@ -1969,7 +1966,7 @@ local function createRoadSession(plugin: Plugin)
 	function session.GetSelectionState(): SelectionState
 		local selected = getSelectedEndpoint()
 		if not selected then
-			return { Kind = "none" :: "none", OutdatedGenerators = outdatedGenerators }
+			return { Kind = "none" :: "none" }
 		end
 		local partner = getPartnerEndpoint()
 		local layout = RoadMath.endLayout(selected.Segment, selected.Id)

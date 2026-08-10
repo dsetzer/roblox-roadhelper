@@ -80,9 +80,7 @@ return function(plugin: Plugin, panel: DockWidgetPluginGui, buttonClicked: Signa
 			assert(reactRoot, "We just created it")
 			reactRoot:render(React.createElement(RoadHelperGui, {
 				GuiState = getGuiState(),
-				SelectionState = if session
-						then session.GetSelectionState()
-						else { Kind = "none" :: "none", OutdatedGenerators = 0 },
+				SelectionState = if session then session.GetSelectionState() else { Kind = "none" :: "none" },
 				SetAdjustValue = function(axis: RoadMath.AdjustAxis, value: number)
 					if session then
 						session.SetAdjustValue(axis, value)

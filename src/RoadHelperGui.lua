@@ -434,45 +434,11 @@ local function TaperPanel(props: {
 	LayoutOrder: number?,
 })
 	local state = props.SelectionState
-	-- Intersections carry a lane layout per road rather than per end, so
-	-- there is nothing to taper between. With nothing selected the section
-	-- still appears when the place has roads needing an upgrade, since that
-	-- is the first thing worth telling the user.
+	-- Nothing selected means nothing to act on: a place with no roads has
+	-- nothing to upgrade, and a place with roads shows the notice as soon as
+	-- one is selected. Intersections carry a lane layout per road rather than
+	-- per end, so there is nothing to taper between either.
 	if state.Kind == "none" or (state :: any).SegmentKind == "Intersection" then
-		if (state :: any).OutdatedGenerators and (state :: any).OutdatedGenerators > 0 then
-			return e(SubPanel, {
-				Title = "Taper",
-				Padding = UDim.new(0, 6),
-				LayoutOrder = props.LayoutOrder,
-			}, {
-				Notice = e("TextLabel", {
-					Size = UDim2.new(1, 0, 0, 0),
-					AutomaticSize = Enum.AutomaticSize.Y,
-					BackgroundTransparency = 1,
-					TextColor3 = Colors.OFFWHITE,
-					RichText = true,
-					Text = describeOutdated((state :: any).OutdatedGenerators),
-					TextWrapped = true,
-					TextXAlignment = Enum.TextXAlignment.Left,
-					Font = Enum.Font.SourceSans,
-					TextSize = 15,
-					LayoutOrder = 1,
-				}),
-				UpgradeAll = e(HelpGui.WithHelpIcon, {
-					Help = e(HelpGui.BasicTooltip, {
-						HelpRichText = UPGRADE_ALL_HELP,
-					}),
-					LayoutOrder = 2,
-					Subject = e(OperationButton, {
-						Text = `Update all {(state :: any).OutdatedGenerators} generators`,
-						Height = 28,
-						Disabled = false,
-						Color = Colors.ACTION_BLUE,
-						OnClick = props.UpgradeAllGenerators,
-					}),
-				}),
-			})
-		end
 		return nil :: any
 	end
 	local endWidth = (state :: any).EndWidth
