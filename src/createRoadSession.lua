@@ -750,6 +750,19 @@ local function createRoadSession(plugin: Plugin)
 		therefore budgeted: every SCAN_BUDGET instances it yields a frame, so a
 		big place costs a moment of background work rather than a freeze.
 	]]
+	--[[
+		Models the last full walk found, so adding a road doesn't re-walk the
+		place every time.
+
+		findTemplate runs inside the dragger's mouseDown, which must return
+		without yielding or the drag gesture desyncs — so it can't be budgeted
+		the way the background scan is. Not repeating the walk is the way to
+		keep it cheap instead. Only models are kept: a SegmentInfo caches Size
+		and Pivot, which go stale, so it is re-read on use. nil means "no walk
+		has happened yet", which the next lookup does.
+	]]
+	local knownSegmentModels: { Model }? = nil
+
 	local SCAN_BUDGET = 500
 	local function scanSegments(onSegment: (RoadMath.SegmentInfo) -> ())
 		local budget = SCAN_BUDGET
@@ -778,13 +791,16 @@ local function createRoadSession(plugin: Plugin)
 
 	local function rescanGenerators()
 		local count = 0
+		local models: { Model } = {}
 		scanSegments(function(segment)
+			table.insert(models, segment.Model)
 			if not hasCurrentGenerator(segment.Model) then
 				count += 1
 			end
 		end)
 		if not scanAbandoned then
 			outdatedGenerators = count
+			knownSegmentModels = models
 		end
 	end
 
@@ -1165,13 +1181,20 @@ local function createRoadSession(plugin: Plugin)
 	-- Adding segments
 	--------------------------------------------------------------------------
 
-	-- Scan for a template on demand: this only happens on add clicks, never
-	-- per-frame, so a full workspace scan is acceptable.
-	local function findTemplate(kind: RoadMath.SegmentKind, near: Vector3?): RoadMath.SegmentInfo?
+	-- The nearest segment of a kind, from the models the last walk found. Falls
+	-- back to walking the place when nothing has been cached yet, or when the
+	-- cache holds nothing usable of that kind.
+	local function nearestOf(models: { Model }, kind: RoadMath.SegmentKind, near: Vector3?): RoadMath.SegmentInfo?
 		local best: RoadMath.SegmentInfo? = nil
 		local bestDistance = math.huge
-		for _, segment in RoadMath.findSegments(workspace) do
-			if segment.Kind == kind then
+		for _, model in models do
+			-- Cached models can have been deleted or undone away since; a
+			-- template with no parent would silently produce an unparented road
+			if model.Parent == nil then
+				continue
+			end
+			local segment = RoadMath.getSegmentInfo(model)
+			if segment and segment.Kind == kind then
 				local distance = if near then (segment.Pivot.Position - near).Magnitude else 0
 				if distance < bestDistance then
 					bestDistance = distance
@@ -1180,6 +1203,33 @@ local function createRoadSession(plugin: Plugin)
 			end
 		end
 		return best
+	end
+
+	local function findTemplate(kind: RoadMath.SegmentKind, near: Vector3?): RoadMath.SegmentInfo?
+		local cached = knownSegmentModels
+		if cached then
+			local best = nearestOf(cached, kind, near)
+			if best then
+				return best
+			end
+		end
+		-- Nothing cached of this kind: walk the place, and keep what it finds
+		-- so the next add doesn't have to
+		local models: { Model } = {}
+		for _, segment in RoadMath.findSegments(workspace) do
+			table.insert(models, segment.Model)
+		end
+		knownSegmentModels = models
+		return nearestOf(models, kind, near)
+	end
+
+	-- Keep the cache current as RoadHelper builds roads, so a fresh segment can
+	-- be the template for the next one without another walk
+	local function rememberSegment(model: Model)
+		local cached = knownSegmentModels
+		if cached then
+			table.insert(cached, model)
+		end
 	end
 
 	-- Create a new segment joined to `openEnd`, cloned from a template of the
@@ -1235,6 +1285,7 @@ local function createRoadSession(plugin: Plugin)
 		(newModel :: any).Size = size
 		newModel:PivotTo(pivot)
 		newModel.Parent = sourceModel.Parent
+		rememberSegment(newModel)
 
 		-- A plain click on the straight handle should jut straight out of the
 		-- open end's ACTUAL face even when it is angled: both end Dirs already
@@ -1300,6 +1351,7 @@ local function createRoadSession(plugin: Plugin)
 		local exitLocal = Vector3.new(0, -size.Y / 2, -boxSize / 2)
 		newModel:PivotTo(rotation + (openEnd.WorldCFrame.Position - rotation:VectorToWorldSpace(exitLocal)))
 		newModel.Parent = sourceModel.Parent
+		rememberSegment(newModel)
 		return newModel
 	end
 
@@ -1689,6 +1741,7 @@ local function createRoadSession(plugin: Plugin)
 		;(newModel :: any).Size = size
 		newModel:PivotTo(rotation + target)
 		newModel.Parent = if template then template.Model.Parent else workspace
+		rememberSegment(newModel)
 
 		selectedRef = { Model = newModel, Id = "Red" }
 		if activeRecordingName then
@@ -1995,6 +2048,8 @@ local function createRoadSession(plugin: Plugin)
 
 	local undoCn = ChangeHistoryService.OnUndo:Connect(function(waypointName: string)
 		clearStudioSelectionAfterHistory()
+		-- History destroys and recreates segments, so cached models go stale
+		knownSegmentModels = nil
 		local top = undoSelectionStack[#undoSelectionStack]
 		if top and top.Name == waypointName then
 			table.remove(undoSelectionStack)
@@ -2006,6 +2061,8 @@ local function createRoadSession(plugin: Plugin)
 	end)
 	local redoCn = ChangeHistoryService.OnRedo:Connect(function(waypointName: string)
 		clearStudioSelectionAfterHistory()
+		-- History destroys and recreates segments, so cached models go stale
+		knownSegmentModels = nil
 		local top = redoSelectionStack[#redoSelectionStack]
 		if top and top.Name == waypointName then
 			table.remove(redoSelectionStack)
@@ -2478,6 +2535,7 @@ local function createRoadSession(plugin: Plugin)
 		;(newModel :: any).Size = Vector3.new(wZ + extra, 0, wX + extra)
 		newModel:PivotTo(CFrame.Angles(0, yaw, 0) + target)
 		newModel.Parent = if template then template.Model.Parent else workspace
+		rememberSegment(newModel)
 
 		selectedRef = { Model = newModel, Id = "ZPlus" }
 		if activeRecordingName then

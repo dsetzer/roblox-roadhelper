@@ -52,7 +52,9 @@ lazy-loads `src/main.lua` on first activation.
   detection, and Adjust-attribute sign mapping for rotations at either end color.
 - `src/createRoadSession.lua` — Active tool session: mounts a DraggerFramework
   DraggerToolComponent with a custom handle list, tracks the selected endpoint, applies edits
-  with ChangeHistoryService recordings.
+  with ChangeHistoryService recordings. Workspace walks are kept off the main thread's back:
+  the generator scan yields every few hundred instances, and template lookup reuses the models
+  that walk found rather than re-walking (it runs inside mouseDown, so it can't yield).
 - `src/Handles/` — Handle implementations following the DraggerFramework handles protocol
   (`update`/`hitTest`/`render`/`mouseDown`/`mouseDrag`/`mouseUp`):
   - `EndpointPickHandles.lua` — clickable markers on every road endpoint.
