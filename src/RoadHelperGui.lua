@@ -316,7 +316,7 @@ local function SizingPanel(props: {
 	}, {
 		LaneCountInput = e(HelpGui.WithHelpIcon, {
 			Help = e(HelpGui.BasicTooltip, {
-				HelpRichText = "Number of lanes. An odd count adds a shared center turn lane. The bounds adjust so both endpoints stay in place.",
+				HelpRichText = "Number of lanes. An odd count adds a shared center turn lane. The bounds adjust so both endpoints stay in place. On a tapered road this changes the selected end only.",
 			}),
 			LayoutOrder = 1,
 			Subject = e(NumberInput, {
@@ -331,7 +331,7 @@ local function SizingPanel(props: {
 		}),
 		LaneWidthInput = e(HelpGui.WithHelpIcon, {
 			Help = e(HelpGui.BasicTooltip, {
-				HelpRichText = "Width of each lane in studs. The bounds adjust so both endpoints stay in place.",
+				HelpRichText = "Width of each lane in studs. The bounds adjust so both endpoints stay in place. On a tapered road this changes the selected end only.",
 			}),
 			LayoutOrder = 2,
 			Subject = e(NumberInput, {
@@ -348,7 +348,7 @@ local function SizingPanel(props: {
 		}),
 		SidewalkWidthInput = e(HelpGui.WithHelpIcon, {
 			Help = e(HelpGui.BasicTooltip, {
-				HelpRichText = "Width of the raised sidewalk on each side, in studs. Zero removes the sidewalks entirely.",
+				HelpRichText = "Width of the raised sidewalk on each side, in studs. Zero removes the sidewalks entirely. On a tapered road this changes the selected end only.",
 			}),
 			LayoutOrder = 3,
 			Subject = e(NumberInput, {
@@ -392,6 +392,196 @@ local function SizingPanel(props: {
 						props.SetSizing("CornerRadius", radius)
 						return radius
 					end,
+				}),
+			})
+			else nil,
+	})
+end
+
+local UPGRADE_ALL_HELP = "Puts every road in the place on the generator packaged with RoadHelper. Attributes are untouched, so the roads regenerate the same — only the code drawing them changes. It is one undo step, so ctrl-Z puts them all back."
+
+local function describeOutdated(count: number): string
+	if count == 1 then
+		return "<b>1 road</b> in this place was made with an older generator, which can't draw tapers."
+	end
+	return `<b>{count} roads</b> in this place were made with an older generator, which can't draw tapers.`
+end
+
+local function describeTaper(state: createRoadSession.SelectionState): string
+	local function studs(value: number): string
+		return string.format("%.4g", value)
+	end
+	local endWidth = (state :: any).EndWidth
+	local segmentWidth = (state :: any).SegmentWidth
+	local neighbourWidth = (state :: any).NeighbourWidth
+	if (state :: any).EndTapered then
+		return `This end is <b>{studs(endWidth)}</b> studs wide, tapering to the road's <b>{studs(segmentWidth)}</b>.`
+	elseif neighbourWidth and math.abs(neighbourWidth - endWidth) > 0.01 then
+		return `This end is <b>{studs(endWidth)}</b> studs wide, its neighbour <b>{studs(neighbourWidth)}</b>.`
+	end
+	return `This segment is <b>{studs(segmentWidth)}</b> studs wide throughout.`
+end
+
+local function TaperPanel(props: {
+	SelectionState: createRoadSession.SelectionState,
+	CurrentSettings: Settings.RoadHelperSettings,
+	UpdatedSettings: () -> (),
+	TaperToNeighbour: () -> (),
+	ClearTaper: () -> (),
+	SetTaperLength: (length: number) -> (),
+	UpdateGenerator: () -> (),
+	UpgradeAllGenerators: () -> (),
+	LayoutOrder: number?,
+})
+	local state = props.SelectionState
+	-- Nothing selected means nothing to act on: a place with no roads has
+	-- nothing to upgrade, and a place with roads shows the notice as soon as
+	-- one is selected. Intersections carry a lane layout per road rather than
+	-- per end, so there is nothing to taper between either.
+	if state.Kind == "none" or (state :: any).SegmentKind == "Intersection" then
+		return nil :: any
+	end
+	local endWidth = (state :: any).EndWidth
+	local neighbourWidth = (state :: any).NeighbourWidth
+	local tapered = (state :: any).EndTapered
+	local mismatched = neighbourWidth ~= nil and math.abs(neighbourWidth - endWidth) > 0.01
+	local nextOrder = createNextOrder()
+	return e(SubPanel, {
+		Title = "Taper",
+		Padding = UDim.new(0, 6),
+		LayoutOrder = props.LayoutOrder,
+	}, {
+		AutoTaper = e(HelpGui.WithHelpIcon, {
+			Help = e(HelpGui.BasicTooltip, {
+				HelpRichText = "Dragging a road end onto a neighbour of a different width tapers that end to the neighbour's lane layout, so the road transitions across the taper length instead of stepping at the joint. The rest of the segment keeps its own width.",
+			}),
+			LayoutOrder = nextOrder(),
+			Subject = e(Checkbox, {
+				Label = "Auto taper",
+				Checked = props.CurrentSettings.AutoTaper,
+				Changed = function(checked: boolean)
+					props.CurrentSettings.AutoTaper = checked
+					props.UpdatedSettings()
+				end,
+			}),
+		}),
+		Widths = e("TextLabel", {
+			Size = UDim2.new(1, 0, 0, 0),
+			AutomaticSize = Enum.AutomaticSize.Y,
+			BackgroundTransparency = 1,
+			TextColor3 = Colors.OFFWHITE,
+			RichText = true,
+			Text = describeTaper(state),
+			TextWrapped = true,
+			TextXAlignment = Enum.TextXAlignment.Left,
+			Font = Enum.Font.SourceSans,
+			TextSize = 16,
+			LayoutOrder = nextOrder(),
+		}),
+		LengthInput = if tapered
+			then e(HelpGui.WithHelpIcon, {
+				Help = e(HelpGui.BasicTooltip, {
+					HelpRichText = "How far back from this end the transition runs. The rest of the segment stays at its own width. Drag the double-headed arrow on the road to set it in the viewport.",
+				}),
+				LayoutOrder = nextOrder(),
+				Subject = e(NumberInput, {
+					Label = "Taper Length",
+					Value = math.round((state :: any).TaperLength),
+					ValueEntered = function(value: number): number?
+						local length = math.max(value, 0)
+						props.SetTaperLength(length)
+						return length
+					end,
+				}),
+			})
+			else nil,
+		MatchButton = if mismatched
+			then e(HelpGui.WithHelpIcon, {
+				Help = e(HelpGui.BasicTooltip, {
+					HelpRichText = "Tapers this end to the neighbour's lane layout. Both endpoints stay put, so the joint stays sealed, and the rest of the segment keeps its width.",
+				}),
+				LayoutOrder = nextOrder(),
+				Subject = e(OperationButton, {
+					Text = "Taper to neighbour",
+					Height = 28,
+					Disabled = false,
+					Color = Colors.ACTION_BLUE,
+					OnClick = props.TaperToNeighbour,
+				}),
+			})
+			else nil,
+		OutdatedNotice = if (state :: any).OutdatedGenerators > 0
+			then e("TextLabel", {
+				Size = UDim2.new(1, 0, 0, 0),
+				AutomaticSize = Enum.AutomaticSize.Y,
+				BackgroundTransparency = 1,
+				TextColor3 = Colors.OFFWHITE,
+				RichText = true,
+				Text = describeOutdated((state :: any).OutdatedGenerators),
+				TextWrapped = true,
+				TextXAlignment = Enum.TextXAlignment.Left,
+				Font = Enum.Font.SourceSans,
+				TextSize = 15,
+				LayoutOrder = nextOrder(),
+			})
+			else nil,
+		UpgradeAllButton = if (state :: any).OutdatedGenerators > 0
+			then e(HelpGui.WithHelpIcon, {
+				Help = e(HelpGui.BasicTooltip, {
+					HelpRichText = UPGRADE_ALL_HELP,
+				}),
+				LayoutOrder = nextOrder(),
+				Subject = e(OperationButton, {
+					Text = `Update all {(state :: any).OutdatedGenerators} generators`,
+					Height = 28,
+					Disabled = false,
+					Color = Colors.ACTION_BLUE,
+					OnClick = props.UpgradeAllGenerators,
+				}),
+			})
+			else nil,
+		GeneratorNotice = if not (state :: any).GeneratorCurrent
+			then e("TextLabel", {
+				Size = UDim2.new(1, 0, 0, 0),
+				AutomaticSize = Enum.AutomaticSize.Y,
+				BackgroundTransparency = 1,
+				TextColor3 = Colors.OFFWHITE,
+				RichText = true,
+				Text = "This road carries its own generator module, which may not draw tapers.",
+				TextWrapped = true,
+				TextXAlignment = Enum.TextXAlignment.Left,
+				Font = Enum.Font.SourceSans,
+				TextSize = 15,
+				LayoutOrder = nextOrder(),
+			})
+			else nil,
+		UpdateGeneratorButton = if not (state :: any).GeneratorCurrent
+			then e(HelpGui.WithHelpIcon, {
+				Help = e(HelpGui.BasicTooltip, {
+					HelpRichText = "Puts this segment on the generator packaged with RoadHelper, replacing the module it carries. Its attributes are untouched, so the road regenerates the same — only the code drawing it changes, which is what lets tapers be drawn.",
+				}),
+				LayoutOrder = nextOrder(),
+				Subject = e(OperationButton, {
+					Text = "Update generator",
+					Height = 28,
+					Disabled = false,
+					Color = Colors.ACTION_BLUE,
+					OnClick = props.UpdateGenerator,
+				}),
+			})
+			else nil,
+		ClearButton = if tapered
+			then e(HelpGui.WithHelpIcon, {
+				Help = e(HelpGui.BasicTooltip, {
+					HelpRichText = "Drops this end's taper, so it goes back to the segment's own width.",
+				}),
+				LayoutOrder = nextOrder(),
+				Subject = e(OperationButton, {
+					Text = "Remove taper",
+					Height = 28,
+					Disabled = false,
+					Color = Colors.ACTION_BLUE,
+					OnClick = props.ClearTaper,
 				}),
 			})
 			else nil,
@@ -663,6 +853,11 @@ local function RoadHelperGui(props: {
 	SetSegmentAttribute: (name: string, value: any) -> (),
 	SetLaneMarkings: (mode: string) -> (),
 	SetSizing: (name: string, value: number) -> (),
+	TaperToNeighbour: () -> (),
+	ClearTaper: () -> (),
+	SetTaperLength: (length: number) -> (),
+	UpdateGenerator: () -> (),
+	UpgradeAllGenerators: () -> (),
 	AddSegment: (kind: RoadMath.SegmentKind) -> (),
 	AddIntersection: (throughRoad: boolean) -> (),
 	CurrentSettings: Settings.RoadHelperSettings,
@@ -705,6 +900,17 @@ local function RoadHelperGui(props: {
 		SizingPanel = e(SizingPanel, {
 			SelectionState = props.SelectionState,
 			SetSizing = props.SetSizing,
+			LayoutOrder = nextOrder(),
+		}),
+		TaperPanel = e(TaperPanel, {
+			SelectionState = props.SelectionState,
+			CurrentSettings = props.CurrentSettings,
+			UpdatedSettings = props.UpdatedSettings,
+			TaperToNeighbour = props.TaperToNeighbour,
+			ClearTaper = props.ClearTaper,
+			SetTaperLength = props.SetTaperLength,
+			UpdateGenerator = props.UpdateGenerator,
+			UpgradeAllGenerators = props.UpgradeAllGenerators,
 			LayoutOrder = nextOrder(),
 		}),
 		AddPanel = e(AddPanel, {

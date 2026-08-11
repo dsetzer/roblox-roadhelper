@@ -24,6 +24,8 @@ import sys
 import websockets
 import websockets.asyncio.server
 
+import staticchecks
+
 PORT = 38741
 CONNECT_TIMEOUT = 30
 CAPTURE_DIR = os.path.expandvars(
@@ -168,6 +170,12 @@ async def run_tests(filter_str: str):
 
 
 def main():
+    # Static checks first: they need neither Studio nor a build, and they catch
+    # the things that compile fine and only fail when someone clicks them.
+    print("Running static checks...")
+    if staticchecks.run() != 0:
+        sys.exit(1)
+
     filter_str = sys.argv[1] if len(sys.argv) > 1 else "all"
     asyncio.run(run_tests(filter_str))
 

@@ -1,7 +1,10 @@
 --!optimize 2
 --!native
--- Packaged copy of the ProceduralCarts StraightRoad generator, used by
--- RoadHelper as a fallback template when a place has no road segments yet.
+-- The StraightRoad generator RoadHelper builds every segment with. A generator is a
+-- child ModuleScript of each segment, so a place holds one copy per road and
+-- nothing ever updates them; this is the copy that is maintained, and the one
+-- new segments (and "Update generator") install. Originally a copy of the
+-- ProceduralCarts StraightRoad generator.
 
 type GenerationFunctionParams<Attributes> = {
 	Attributes: Attributes,
@@ -17,6 +20,22 @@ local defaultAttributes = {
 	LaneWidth = 24,
 	LaneCount = 2,
 	SidewalkWidth = 8,
+	-- Either end may taper: it is built to its own lane layout and the
+	-- cross-section blends back to the road's own over the last
+	-- TaperBlueLength / TaperRedLength studs, transitioning between roads of
+	-- differing widths.
+	-- Zero lane values (and a negative sidewalk width) mean "same as the road",
+	-- so an end can taper in one respect without having to restate the rest
+	TaperBlue = false,
+	TaperBlueLaneWidth = 0,
+	TaperBlueLaneCount = 0,
+	TaperBlueSidewalkWidth = -1,
+	TaperBlueLength = 0,
+	TaperRed = false,
+	TaperRedLaneWidth = 0,
+	TaperRedLaneCount = 0,
+	TaperRedSidewalkWidth = -1,
+	TaperRedLength = 0,
 	MaxAngle = 10,
 	AdjustBlueGrade = 0,
 	AdjustBlueDir = 0,
@@ -91,17 +110,106 @@ local Generator: GeneratorModuleDefinition<typeof(defaultAttributes)> = {
 		-- Lane layout drives the geometry: the lane count sets everything, and Width is the
 		-- lanes plus the two sidewalks. An odd lane count means a shared center lane.
 		-- Lane markings are painted within the roadway, so they don't widen it.
+		--
+		-- Either end may taper: it is built to a lane layout of its own,
+		-- and the cross-section blends back to the road's own layout over
+		-- the last TaperBlue/RedLength studs. The plain attributes stay the
+		-- road's own width, so an untapered generator (or an untapered end)
+		-- draws exactly what it always did.
 		local laneWidth = attributes.LaneWidth
 		local numLanes = attributes.LaneCount
-		local isCenterLaneDrawn = numLanes % 2 ~= 0
-
 		local sidewalkWidth = attributes.SidewalkWidth or 8
 		local width = numLanes * laneWidth + (sidewalkWidth * 2)
+
+		local function readEndLayout(prefix)
+			if attributes[prefix] ~= true then
+				return false, laneWidth, numLanes, sidewalkWidth, width
+			end
+			-- Unset (zero, or negative for the sidewalk) inherits the road's
+			local taperLaneWidth = attributes[prefix .. "LaneWidth"]
+			local taperLaneCount = attributes[prefix .. "LaneCount"]
+			local taperSidewalk = attributes[prefix .. "SidewalkWidth"]
+			local endLaneWidth = if taperLaneWidth and taperLaneWidth > 0 then taperLaneWidth else laneWidth
+			local endNumLanes = if taperLaneCount and taperLaneCount > 0 then taperLaneCount else numLanes
+			local endSidewalk = if taperSidewalk and taperSidewalk >= 0 then taperSidewalk else sidewalkWidth
+			local tapers = endLaneWidth ~= laneWidth
+				or endNumLanes ~= numLanes
+				or endSidewalk ~= sidewalkWidth
+			return tapers, endLaneWidth, endNumLanes, endSidewalk,
+				endNumLanes * endLaneWidth + (endSidewalk * 2)
+		end
+		local hasBlueTaper, blueLaneWidth, blueNumLanes, blueSidewalk, blueWidth = readEndLayout("TaperBlue")
+		local hasRedTaper, redLaneWidth, redNumLanes, redSidewalk, redWidth = readEndLayout("TaperRed")
+		local isTapered = hasBlueTaper or hasRedTaper
+
 		local halfWidth = width / 2
+		local blueHalfWidth = blueWidth / 2
+		local redHalfWidth = redWidth / 2
+		-- The bounding box has to fit the widest cross-section anywhere
+		local maxWidth = math.max(width, blueWidth, redWidth)
+
+		-- Markings follow the widest lane structure: that is the one which has
+		-- to survive, and lanes a narrowing road edge catches up with pinch out
+		-- along the way.
+		local markingLanes = math.max(numLanes, blueNumLanes, redNumLanes)
+		local isCenterLaneDrawn = markingLanes % 2 ~= 0
+
+		local roadLength = size.Z
+
+		--[[
+			Cross-section blend along the road.
+
+			Each taper is confined to a window running back from its own end;
+			everywhere else the road keeps its own width. That confinement is what
+			makes this a taper rather than a segment which merely happens to be two
+			different widths. The two windows are scaled down if together they would
+			overrun the road, so they meet rather than fight over the middle.
+
+			Within a window the blend is smoothstepped, so the road edge leaves and
+			arrives parallel instead of kinking at either end of the transition.
+		--]]
+		local function wantedSpan(has, value)
+			if not has then
+				return 0
+			end
+			local length = if value and value > 0 then value else roadLength / 2
+			return math.clamp(length / math.max(roadLength, 1e-6), 0, 1)
+		end
+		local blueSpan = wantedSpan(hasBlueTaper, attributes.TaperBlueLength)
+		local redSpan = wantedSpan(hasRedTaper, attributes.TaperRedLength)
+		if blueSpan + redSpan > 1 then
+			local scale = 1 / (blueSpan + redSpan)
+			blueSpan *= scale
+			redSpan *= scale
+		end
+
+		local function smoothstep(t)
+			return t * t * (3 - 2 * t)
+		end
+		-- Blend a cross-section value from each end's own to the road's own
+		local function crossAt(u, baseValue, blueValue, redValue)
+			if hasBlueTaper and blueSpan > 0 and u < blueSpan then
+				return blueValue + (baseValue - blueValue) * smoothstep(u / blueSpan)
+			elseif hasRedTaper and redSpan > 0 and u > 1 - redSpan then
+				return baseValue + (redValue - baseValue) * smoothstep((u - (1 - redSpan)) / redSpan)
+			end
+			return baseValue
+		end
+		local function halfWidthAt(u)
+			return crossAt(u, halfWidth, blueHalfWidth, redHalfWidth)
+		end
+		local function sidewalkAt(u)
+			return crossAt(u, sidewalkWidth, blueSidewalk, redSidewalk)
+		end
+		local function laneWidthAt(u)
+			return crossAt(u, laneWidth, blueLaneWidth, redLaneWidth)
+		end
+		local function edgeLineAt(u)
+			return halfWidthAt(u) - sidewalkAt(u) - EDGE_INSET
+		end
 
 		local hRoadTop = ROAD_THICKNESS
 		local hSideTop = ROAD_THICKNESS + CURB_HEIGHT
-		local edgeLine = halfWidth - sidewalkWidth - EDGE_INSET
 		-- Blue adjustments apply to the start end of the road (u = 0), red to the end
 		-- end (u = 1) — matching the colors of the snapping helper cubes.
 		local gradeStartSlope = math.tan(math.rad(attributes.AdjustBlueGrade or 0))
@@ -130,7 +238,7 @@ local Generator: GeneratorModuleDefinition<typeof(defaultAttributes)> = {
 		-- snapping helpers mark the nominal box-aligned corners). Flip mirrors
 		-- everything horizontally.
 		local length = size.Z
-		local sway = math.max((size.X - width) / 2, 0)
+		local sway = math.max((size.X - maxWidth) / 2, 0)
 		local flipSign = if attributes.Flip then -1 else 1
 		local dirStart = math.rad(attributes.AdjustBlueDir or 0)
 		local dirEnd = math.rad(attributes.AdjustRedDir or 0)
@@ -142,7 +250,7 @@ local Generator: GeneratorModuleDefinition<typeof(defaultAttributes)> = {
 			return x * c + z * s, -x * s + z * c
 		end
 
-		local halfX = sway + halfWidth
+		local halfX = sway + maxWidth / 2
 		local halfZ = length / 2
 		local p0x, p0z = -sway, -halfZ
 		local t0x, t0z = rot2(0, 1, dirStart)
@@ -252,9 +360,32 @@ local Generator: GeneratorModuleDefinition<typeof(defaultAttributes)> = {
 			return CFrame.fromMatrix(Vector3.new(x, climbY(u), z), lateral, up)
 		end
 
+		-- The angle a tapering road edge makes with the centreline. The blend is
+		-- a smoothstep, so d(halfWidth)/du = deltaHalfWidth * 6u(1-u); the edge
+		-- swings away from parallel and back over the length of the taper, and
+		-- that swing is a direction change like any other.
+		local function taperAngleAt(u)
+			if not isTapered then
+				return 0
+			end
+			-- Angle of the tapering road edge to the centreline. The window's own
+			-- length matters: a short taper deflects the edge more sharply and so
+			-- needs finer tessellation.
+			local delta, span, t
+			if hasBlueTaper and blueSpan > 0 and u < blueSpan then
+				delta, span, t = halfWidth - blueHalfWidth, blueSpan, u / blueSpan
+			elseif hasRedTaper and redSpan > 0 and u > 1 - redSpan then
+				delta, span, t = redHalfWidth - halfWidth, redSpan, (u - (1 - redSpan)) / redSpan
+			else
+				return 0
+			end
+			return math.atan(delta * 6 * t * (1 - t) / math.max(span * totalLen, 1e-6))
+		end
+
 		-- cost LUT over arc length: segmentation driven by direction change (the
 		-- horizontal turn plus any climb pitch, via the 3D tangent) plus twist (bank
-		-- changing along the road), both measured vs MaxAngle.
+		-- changing along the road) plus the taper's edge swing, all measured vs
+		-- MaxAngle.
 		local maxAngle = math.rad(attributes.MaxAngle or 5)
 		local costLut = {}
 		costLut[1] = 0
@@ -265,9 +396,11 @@ local Generator: GeneratorModuleDefinition<typeof(defaultAttributes)> = {
 			local _, _, fx, fz = pathAt(s)
 			local tan = Vector3.new(fx, climbDeriv(s / totalLen), fz).Unit
 			local twist = math.abs(bankAt((i - 1) / LUT_N) - bankAt((i - 2) / LUT_N))
+			local taperTurn = math.abs(taperAngleAt((i - 1) / LUT_N) - taperAngleAt((i - 2) / LUT_N))
 			costLut[i] = costLut[i - 1]
 				+ math.acos(math.clamp(tan:Dot(prevTan), -1, 1)) / maxAngle
 				+ twist / maxAngle
+				+ taperTurn / maxAngle
 			prevTan = tan
 		end
 		local totalCost = costLut[LUT_N + 1]
@@ -292,15 +425,21 @@ local Generator: GeneratorModuleDefinition<typeof(defaultAttributes)> = {
 			else math.max(1, MIN_SEGMENTS - 2, math.ceil(totalCost) - 1)
 		local totalNumSegments = innerSliceCount + 2
 		local fullCost = totalCost / (innerSliceCount + 1)
+		-- sliceU[i] is the slice's fraction along the road, which the tapering
+		-- cross-section is evaluated at
 		local sliceCFrames = {}
+		local sliceU = {}
 		sliceCFrames[1] = pathSliceCFrameAt(0)
+		sliceU[1] = 0
 		for i = 0, innerSliceCount do
 			local s = if fullCost > 0
 				then sForCost(fullCost * (0.5 + i))
 				else (i + 0.5) / (innerSliceCount + 1) * totalLen
 			sliceCFrames[i + 2] = pathSliceCFrameAt(s)
+			sliceU[i + 2] = s / totalLen
 		end
 		sliceCFrames[totalNumSegments + 1] = pathSliceCFrameAt(totalLen)
+		sliceU[totalNumSegments + 1] = 1
 		-- ends need no squaring: the end slices use the exact turned end headings, and
 		-- the climb profile's end pitch is exactly the configured grade (zero by default).
 
@@ -377,53 +516,57 @@ local Generator: GeneratorModuleDefinition<typeof(defaultAttributes)> = {
 		--]]
 		-- Build a sorted list of every lane marking: its lateral position and color.
 		-- Edge markings are always present; the rest depend on lane count parity.
+		-- Positions are functions of the fraction along the road so that they
+		-- follow a tapering cross-section; on an untapered road every one of
+		-- them is constant.
 		local laneMarkings = {
-			{ lat = -edgeLine, color = laneMarkingColor },
-			{ lat = edgeLine, color = laneMarkingColor },
+			{ latAt = function(u) return -edgeLineAt(u) end, color = laneMarkingColor },
+			{ latAt = edgeLineAt, color = laneMarkingColor },
 		}
 
 		if not isCenterLaneDrawn then
 			-- Even lane count: a lane boundary sits on the centreline, so opposing traffic is
 			-- split by the double-yellow center lines; interior boundaries get dotted dividers.
-			local half = numLanes / 2
+			local half = markingLanes / 2
 
 			for i = 1, half - 1 do
 				table.insert(laneMarkings, {
-					lat = -i * laneWidth,
+					latAt = function(u) return -i * laneWidthAt(u) end,
 					color = laneMarkingColor,
 					isDotted = true,
 				})
 				table.insert(laneMarkings, {
-					lat = i * laneWidth,
+					latAt = function(u) return i * laneWidthAt(u) end,
 					color = laneMarkingColor,
 					isDotted = true,
 				})
 			end
-			table.insert(laneMarkings, { lat = -CENTER_OFFSET, color = centerlineColor })
-			table.insert(laneMarkings, { lat = CENTER_OFFSET, color = centerlineColor })
+			table.insert(laneMarkings, { latAt = function() return -CENTER_OFFSET end, color = centerlineColor })
+			table.insert(laneMarkings, { latAt = function() return CENTER_OFFSET end, color = centerlineColor })
 		else
 			-- Odd lane count: a shared center lane straddles lat = 0, bounded by yellow lines
-			local markingsOnEachSide = (numLanes - 1) / 2
-			local halfLaneWidth = laneWidth / 2
+			local markingsOnEachSide = (markingLanes - 1) / 2
 
 			for _, sign in { -1, 1 } do
 				for i = 1, markingsOnEachSide do
-					local lat = (halfLaneWidth + (i - 1) * laneWidth) * sign
+					local function latAt(u)
+						return (i - 0.5) * laneWidthAt(u) * sign
+					end
 					if i == 1 then
 						table.insert(laneMarkings, {
-							lat = lat - (1 * sign),
+							latAt = function(u) return latAt(u) - (1 * sign) end,
 							color = centerlineColor,
 							isDotted = true,
 							dotOffset = 4,
 							skipAsphaltBoundary = true,
 						})
 						table.insert(laneMarkings, {
-							lat = lat,
+							latAt = latAt,
 							color = centerlineColor,
 						})
 					else
 						table.insert(laneMarkings, {
-							lat = lat,
+							latAt = latAt,
 							color = laneMarkingColor,
 							isDotted = true,
 						})
@@ -432,27 +575,33 @@ local Generator: GeneratorModuleDefinition<typeof(defaultAttributes)> = {
 			end
 		end
 
+		-- Ordering is taken at the blue end; the per-slice evaluation below
+		-- keeps the boundaries monotonic wherever a taper would reorder them.
 		table.sort(laneMarkings, function(a, b)
-			return a.lat < b.lat
+			return a.latAt(0) < b.latAt(0)
 		end)
 
 		-- Asphalt surface: one quad-strip per lane, with boundaries at marking centers.
 		-- The outer strips (-halfWidth → first marking and last marking → +halfWidth)
 		-- cover the road shoulders that sit under the raised curbs.
+		local function negHalfWidthAt(u)
+			return -halfWidthAt(u)
+		end
 		local asphaltBoundaries
 		if hasVerticality then
 			-- Road climbs: split at every marking so each quad stays close to planar
 			asphaltBoundaries = {}
-			table.insert(asphaltBoundaries, -halfWidth)
+			table.insert(asphaltBoundaries, negHalfWidthAt)
 			for _, marking in laneMarkings do
 				if not marking.skipAsphaltBoundary then
-					table.insert(asphaltBoundaries, marking.lat)
+					table.insert(asphaltBoundaries, marking.latAt)
 				end
 			end
-			table.insert(asphaltBoundaries, halfWidth)
+			table.insert(asphaltBoundaries, halfWidthAt)
 		else
-			-- Flat road: a single strip across the full width is always planar
-			asphaltBoundaries = { -halfWidth, halfWidth }
+			-- Flat road: a single strip across the full width is always planar,
+			-- tapering or not (a trapezoid is still flat)
+			asphaltBoundaries = { negHalfWidthAt, halfWidthAt }
 		end
 
 		-- Twist makes strip quads non-planar, and their triangles crease visibly
@@ -485,29 +634,53 @@ local Generator: GeneratorModuleDefinition<typeof(defaultAttributes)> = {
 			local subdivided = { asphaltBoundaries[1] }
 			for i = 2, #asphaltBoundaries do
 				local a, b = asphaltBoundaries[i - 1], asphaltBoundaries[i]
-				local pieces = math.max(math.ceil((b - a) / maxStripWidth - 0.01), 1)
+				-- Size the split for the widest the strip gets anywhere along a taper
+				local strip = math.max(b(0) - a(0), b(1) - a(1))
+				local pieces = math.max(math.ceil(strip / maxStripWidth - 0.01), 1)
 				for piece = 1, pieces - 1 do
-					table.insert(subdivided, a + (b - a) * piece / pieces)
+					local fraction = piece / pieces
+					table.insert(subdivided, function(u)
+						local low = a(u)
+						return low + (b(u) - low) * fraction
+					end)
 				end
 				table.insert(subdivided, b)
 			end
 			asphaltBoundaries = subdivided
 		end
 
+		-- Resolve the boundaries at each slice. Clamping to the road edges (and
+		-- to each other) is what pinches the surplus lanes out where a taper
+		-- narrows past them, instead of letting strips invert.
+		local sliceBoundaries = {}
+		for i = 1, totalNumSegments + 1 do
+			local u = sliceU[i]
+			local edge = halfWidthAt(u)
+			local lats = table.create(#asphaltBoundaries)
+			local previous = -edge
+			for boundIndex, latAt in asphaltBoundaries do
+				local lat = math.max(math.min(latAt(u), edge), previous)
+				lats[boundIndex] = lat
+				previous = lat
+			end
+			sliceBoundaries[i] = lats
+		end
+
 		for segIndex = 1, totalNumSegments do
 			local thisSlice = sliceCFrames[segIndex]
 			local nextSlice = sliceCFrames[segIndex + 1]
+			local thisLats = sliceBoundaries[segIndex]
+			local nextLats = sliceBoundaries[segIndex + 1]
 
 			for boundIndex = 1, #asphaltBoundaries - 1 do
-				local leftEdge = asphaltBoundaries[boundIndex]
-				local rightEdge = asphaltBoundaries[boundIndex + 1]
-				local stripWidth = rightEdge - leftEdge
-				if stripWidth > 0.01 then
+				local thisLeft, thisRight = thisLats[boundIndex], thisLats[boundIndex + 1]
+				local nextLeft, nextRight = nextLats[boundIndex], nextLats[boundIndex + 1]
+				if thisRight - thisLeft > 0.01 or nextRight - nextLeft > 0.01 then
 					quad(
-						thisSlice * Vector3.new(leftEdge, hRoadTop, 0),
-						thisSlice * Vector3.new(rightEdge, hRoadTop, 0),
-						nextSlice * Vector3.new(rightEdge, hRoadTop, 0),
-						nextSlice * Vector3.new(leftEdge, hRoadTop, 0),
+						thisSlice * Vector3.new(thisLeft, hRoadTop, 0),
+						thisSlice * Vector3.new(thisRight, hRoadTop, 0),
+						nextSlice * Vector3.new(nextRight, hRoadTop, 0),
+						nextSlice * Vector3.new(nextLeft, hRoadTop, 0),
 						roadColor,
 						roadMaterial,
 						roadMaterialVariant,
@@ -519,15 +692,16 @@ local Generator: GeneratorModuleDefinition<typeof(defaultAttributes)> = {
 
 		-- Raised curbs / sidewalks
 		for _, sgn in { -1, 1 } do
-			local innerLat = sgn * (halfWidth - sidewalkWidth)
-			local outerLat = sgn * halfWidth
 			for i = 1, totalNumSegments do
 				local fa, fb = sliceCFrames[i], sliceCFrames[i + 1]
+				local ua, ub = sliceU[i], sliceU[i + 1]
+				local innerA, outerA = sgn * (halfWidthAt(ua) - sidewalkAt(ua)), sgn * halfWidthAt(ua)
+				local innerB, outerB = sgn * (halfWidthAt(ub) - sidewalkAt(ub)), sgn * halfWidthAt(ub)
 				quad(
-					fa * Vector3.new(innerLat, hSideTop, 0),
-					fa * Vector3.new(outerLat, hSideTop, 0),
-					fb * Vector3.new(outerLat, hSideTop, 0),
-					fb * Vector3.new(innerLat, hSideTop, 0),
+					fa * Vector3.new(innerA, hSideTop, 0),
+					fa * Vector3.new(outerA, hSideTop, 0),
+					fb * Vector3.new(outerB, hSideTop, 0),
+					fb * Vector3.new(innerB, hSideTop, 0),
 					sidewalkColor,
 					SIDEWALK_MATERIAL,
 					SIDEWALK_MATERIAL_VARIANT,
@@ -555,14 +729,23 @@ local Generator: GeneratorModuleDefinition<typeof(defaultAttributes)> = {
 		local drawnMarkings = if haveLaneMarkings then laneMarkings else {}
 		for _, marking in drawnMarkings do
 			local color = marking.color
-			local lat = marking.lat
 			local isDotted = marking.isDotted
 			local dotOffset = marking.dotOffset or 0
 
 			for i = 1, totalNumSegments do
 				parameters:Pause()
-				local pa = sliceCFrames[i] * Vector3.new(lat, hRoadTop + 0.05, 0)
-				local pb = sliceCFrames[i + 1] * Vector3.new(lat, hRoadTop + 0.05, 0)
+				local ua, ub = sliceU[i], sliceU[i + 1]
+				local latA, latB = marking.latAt(ua), marking.latAt(ub)
+				-- Where a narrowing taper's edge line has caught up with a
+				-- marking, that lane is gone: the marking stops rather than
+				-- running out over the shoulder or doubling up on the edge.
+				if isTapered
+					and (math.abs(latA) > edgeLineAt(ua) + 0.01 or math.abs(latB) > edgeLineAt(ub) + 0.01)
+				then
+					continue
+				end
+				local pa = sliceCFrames[i] * Vector3.new(latA, hRoadTop + 0.05, 0)
+				local pb = sliceCFrames[i + 1] * Vector3.new(latB, hRoadTop + 0.05, 0)
 				if (pb - pa).Magnitude < 1e-4 then
 					continue
 				end
@@ -629,14 +812,14 @@ local Generator: GeneratorModuleDefinition<typeof(defaultAttributes)> = {
 			local blendAngle = math.rad(attributes.BlendAngle or 30)
 			local cosA, sinA = math.cos(blendAngle), math.sin(blendAngle)
 			-- No sidewalk means no raised curb: the skirt attaches at road level instead
-			local blendTop = if sidewalkWidth > 0 then hSideTop else hRoadTop
+			local blendTop = if math.max(sidewalkWidth, blueSidewalk, redSidewalk) > 0 then hSideTop else hRoadTop
 			for _, sgn in { -1, 1 } do
 				local prevAlongU, prevDownU
 				for i = 1, totalNumSegments do
 					parameters:Pause()
 					local fa, fb = sliceCFrames[i], sliceCFrames[i + 1]
-					local topA = fa * Vector3.new(sgn * halfWidth, blendTop, 0)
-					local topB = fb * Vector3.new(sgn * halfWidth, blendTop, 0)
+					local topA = fa * Vector3.new(sgn * halfWidthAt(sliceU[i]), blendTop, 0)
+					local topB = fb * Vector3.new(sgn * halfWidthAt(sliceU[i + 1]), blendTop, 0)
 					local slopeA = fa:VectorToWorldSpace(Vector3.new(sgn * cosA, -sinA, 0)) * BLEND_LENGTH
 					local slopeB = fb:VectorToWorldSpace(Vector3.new(sgn * cosA, -sinA, 0)) * BLEND_LENGTH
 
@@ -719,10 +902,10 @@ local Generator: GeneratorModuleDefinition<typeof(defaultAttributes)> = {
 			end
 			local blue = Color3.fromRGB(0, 100, 255)
 			local red = Color3.fromRGB(255, 40, 40)
-			helperCube(blue, p0x - halfWidth, climbY(0), -halfZ + 2)
-			helperCube(blue, p0x + halfWidth, climbY(0), -halfZ + 2)
-			helperCube(red, p1x - halfWidth, climbY(1), halfZ - 2)
-			helperCube(red, p1x + halfWidth, climbY(1), halfZ - 2)
+			helperCube(blue, p0x - blueHalfWidth, climbY(0), -halfZ + 2)
+			helperCube(blue, p0x + blueHalfWidth, climbY(0), -halfZ + 2)
+			helperCube(red, p1x - redHalfWidth, climbY(1), halfZ - 2)
+			helperCube(red, p1x + redHalfWidth, climbY(1), halfZ - 2)
 		end
 	end,
 }

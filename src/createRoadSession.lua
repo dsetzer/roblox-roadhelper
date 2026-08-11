@@ -36,6 +36,7 @@ local PartialRotateHandleView = require("./Dragger/PartialRotateHandleView")
 local EndpointMoveHandles = require("./Handles/EndpointMoveHandles")
 local EndpointRotateHandles = require("./Handles/EndpointRotateHandles")
 local AddHandles = require("./Handles/AddHandles")
+local TaperHandles = require("./Handles/TaperHandles")
 
 local REFRESH_INTERVAL = 0.25
 local JOINT_SEARCH_RADIUS = 10
@@ -63,9 +64,24 @@ export type SelectionState = {
 	HaveLaneMarkings: boolean,
 	TextureLaneMarkings: boolean,
 	MaxAngle: number,
+	-- Lane layout of the SELECTED end (a tapered road is a different layout
+	-- at each end)
 	LaneCount: number,
 	LaneWidth: number,
 	SidewalkWidth: number,
+	-- Road width at the selected end, the segment's own width, and the width
+	-- of the joined neighbour's end (nil when the endpoint is open)
+	EndWidth: number,
+	SegmentWidth: number,
+	NeighbourWidth: number?,
+	-- Whether the selected end tapers, and over how many studs
+	EndTapered: boolean,
+	TaperLength: number,
+	-- Whether the segment is running RoadHelper's own generator, which is what
+	-- decides whether the features the plugin writes get drawn at all
+	GeneratorCurrent: boolean,
+	-- How many segments in the place are still on an older generator
+	OutdatedGenerators: number,
 	IntersectionAngle: number,
 	-- Nominal corner curve radius of an intersection (half the bounding box
 	-- size in excess of the roads' widths and crosswalks; exact at 90 degrees)
@@ -138,10 +154,75 @@ local GENERATOR_MODULE_NAMES: { [RoadMath.SegmentKind]: string } = {
 	Intersection = "RoadIntersectionGenerator",
 }
 
--- Build a brand new segment from the generator templates packaged inside the
--- plugin, so RoadHelper works even in a place with no road segments yet.
+--[[
+	New segments are cloned from an existing one where there is one to clone,
+	and built from the packaged generator only when the place has none of that
+	kind yet.
+
+	Cloning inherits a generator that is already loaded and running, which
+	keeps a fresh module load — and every way one can fail — off the path that
+	adding a road takes. The cost is that a clone carries whatever generator
+	version its neighbour had, so it may not implement tapering; generators
+	RoadHelper installs are stamped, and "Update generator" swaps a segment
+	onto the packaged one.
+
+	Either way the appearance attributes are copied onto the new model BEFORE
+	it is parented, so it generates once, already correct.
+]]
 local Templates = script.Parent.Templates
-local function createFallbackSegmentModel(kind: RoadMath.SegmentKind): Model?
+-- Stamped on generators RoadHelper installs, so a segment carrying an older
+-- hand-placed generator can be told apart from an up-to-date one
+local GENERATOR_MARKER = "RoadHelperGenerator"
+local GENERATOR_VERSION = 1
+
+local function installGenerator(model: Model, kind: RoadMath.SegmentKind): Instance?
+	local generator = Templates:FindFirstChild(GENERATOR_MODULE_NAMES[kind])
+	if not generator then
+		return nil
+	end
+	local generatorCopy = generator:Clone()
+	generatorCopy:SetAttribute(GENERATOR_MARKER, GENERATOR_VERSION)
+	generatorCopy.Parent = model
+	-- The engine binds the model to its generator through this property;
+	-- it does not discover the module by name.
+	;(model :: any).Generator = generatorCopy
+	return generatorCopy
+end
+
+-- Swap a segment onto the packaged generator, dropping whatever module it was
+-- carrying. The attributes live on the model, so the road regenerates from the
+-- same parameters — only the code drawing it changes.
+local function replaceGenerator(model: Model, kind: RoadMath.SegmentKind): boolean
+	local previous: { Instance } = {}
+	local name = GENERATOR_MODULE_NAMES[kind]
+	for _, child in model:GetChildren() do
+		if child.Name == name and child:IsA("ModuleScript") then
+			table.insert(previous, child)
+		end
+	end
+	local installed = installGenerator(model, kind)
+	if not installed then
+		warn(`RoadHelper: The packaged {kind} generator is missing from the plugin.`)
+		return false
+	end
+	for _, old in previous do
+		if old ~= installed then
+			old:Destroy()
+		end
+	end
+	return true
+end
+
+-- Whether a segment is already running the packaged generator at this version
+local function hasCurrentGenerator(model: Model): boolean
+	local generator = (model :: any).Generator
+	if not generator then
+		return false
+	end
+	return generator:GetAttribute(GENERATOR_MARKER) == GENERATOR_VERSION
+end
+
+local function createSegmentModel(kind: RoadMath.SegmentKind, size: Vector3?): Model?
 	local ok, model = pcall(function()
 		return Instance.new("ProceduralModel" :: any) :: any
 	end)
@@ -153,13 +234,16 @@ local function createFallbackSegmentModel(kind: RoadMath.SegmentKind): Model?
 		then "StraightRoad"
 		elseif kind == "Curve" then "CurveRoad"
 		else "RoadIntersection"
-	local generator = Templates:FindFirstChild(GENERATOR_MODULE_NAMES[kind])
-	if generator then
-		local generatorCopy = generator:Clone()
-		generatorCopy.Parent = model
-		-- The engine binds the model to its generator through this property;
-		-- it does not discover the module by name.
-		model.Generator = generatorCopy
+	-- Size before the generator is bound: a fresh ProceduralModel carries a
+	-- default size, and binding the generator to that would have it generate
+	-- once at a shape nobody asked for before the real one is applied.
+	if size then
+		model.Size = size
+	end
+	if not installGenerator(model, kind) then
+		warn(`RoadHelper: The packaged {kind} generator is missing from the plugin.`)
+		model:Destroy()
+		return nil
 	end
 	return model :: Model
 end
@@ -168,6 +252,18 @@ end
 -- not copied onto newly added segments.
 local GEOMETRY_ATTRIBUTES = {
 	Flip = true,
+	-- A taper belongs to the transition it was built for, never to the next
+	-- segment along
+	TaperBlue = true,
+	TaperBlueLaneCount = true,
+	TaperBlueLaneWidth = true,
+	TaperBlueSidewalkWidth = true,
+	TaperBlueLength = true,
+	TaperRed = true,
+	TaperRedLaneCount = true,
+	TaperRedLaneWidth = true,
+	TaperRedSidewalkWidth = true,
+	TaperRedLength = true,
 	AdjustBlueDir = true,
 	AdjustBlueGrade = true,
 	AdjustBlueBank = true,
@@ -519,6 +615,15 @@ local function createRoadSession(plugin: Plugin)
 			for name, value in swapped do
 				model:SetAttribute(name, value)
 			end
+			-- A taper is likewise pinned to the geographic ends: the wide end
+			-- has to stay with the neighbour it was matched to.
+			local info = RoadMath.getSegmentInfo(model)
+			local swappedTaper = if info then RoadMath.swappedTaperValues(info) else nil
+			if swappedTaper then
+				for name, value in swappedTaper do
+					model:SetAttribute(name, value)
+				end
+			end
 		end
 		if wasFlipped ~= solution.Flip then
 			-- Flipping changes the world meaning of some adjust attributes
@@ -615,6 +720,226 @@ local function createRoadSession(plugin: Plugin)
 		end
 	end
 
+	--------------------------------------------------------------------------
+	-- Tapering
+	--------------------------------------------------------------------------
+
+	-- Auto taper: when a road end lands on a neighbour of a different width,
+	-- rebuild that end to the neighbour's lane layout so the segment tapers
+	-- between the two instead of stepping. Off, ends just butt together.
+	local autoTaper = true
+
+	--[[
+		Roads made before the taper update carry a generator that predates it,
+		and no amount of attribute setting makes such a generator draw a taper
+		— the transition is code, not a parameter. They can't be detected by
+		reading the module (that needs script injection permission), so the
+		test is whether RoadHelper installed the generator itself: anything
+		unstamped is treated as possibly outdated and offered an upgrade.
+	]]
+	local outdatedGenerators = 0
+	-- Set when the session is torn down, so a scan in flight gives up rather
+	-- than walking a workspace nobody is looking at any more
+	local scanAbandoned = false
+
+	--[[
+		Walk the workspace for segments, yielding as it goes.
+
+		A real place holds far more instances than a test one, and doing this in
+		a single pass blocks Studio for as long as it takes. The visit is
+		therefore budgeted: every SCAN_BUDGET instances it yields a frame, so a
+		big place costs a moment of background work rather than a freeze.
+	]]
+	--[[
+		Models the last full walk found, so adding a road doesn't re-walk the
+		place every time.
+
+		findTemplate runs inside the dragger's mouseDown, which must return
+		without yielding or the drag gesture desyncs — so it can't be budgeted
+		the way the background scan is. Not repeating the walk is the way to
+		keep it cheap instead. Only models are kept: a SegmentInfo caches Size
+		and Pivot, which go stale, so it is re-read on use. nil means "no walk
+		has happened yet", which the next lookup does.
+	]]
+	local knownSegmentModels: { Model }? = nil
+
+	local SCAN_BUDGET = 500
+	local function scanSegments(onSegment: (RoadMath.SegmentInfo) -> ())
+		local budget = SCAN_BUDGET
+		local function visit(container: Instance)
+			for _, child in container:GetChildren() do
+				if scanAbandoned then
+					return
+				end
+				budget -= 1
+				if budget <= 0 then
+					budget = SCAN_BUDGET
+					task.wait()
+				end
+				local info = RoadMath.getSegmentInfo(child)
+				if info then
+					onSegment(info)
+				elseif not child:IsA("BasePart") then
+					-- Segments never contain segments, and BaseParts never
+					-- contain either, so neither is worth descending into
+					visit(child)
+				end
+			end
+		end
+		visit(workspace)
+	end
+
+	local function rescanGenerators()
+		local count = 0
+		local models: { Model } = {}
+		scanSegments(function(segment)
+			table.insert(models, segment.Model)
+			if not hasCurrentGenerator(segment.Model) then
+				count += 1
+			end
+		end)
+		if not scanAbandoned then
+			outdatedGenerators = count
+			knownSegmentModels = models
+		end
+	end
+
+	local function setLayoutAttributes(model: Model, attributes: { [string]: any })
+		for name, value in attributes do
+			if model:GetAttribute(name) ~= value then
+				model:SetAttribute(name, value)
+			end
+		end
+	end
+
+	-- A taper only renders if the segment's generator implements it. Segments
+	-- RoadHelper built carry its own generator and always do; one placed by
+	-- hand carries whatever module it was made with, which may predate the
+	-- taper attributes entirely. Say so once rather than leaving the user
+	-- staring at a road that won't taper.
+	local warnedAboutGenerator = false
+	local function warnIfGeneratorLacksTaper(model: Model)
+		if warnedAboutGenerator or hasCurrentGenerator(model) then
+			return
+		end
+		warnedAboutGenerator = true
+		warn("RoadHelper: this road was built with its own generator module, which may not "
+			.. "implement tapering. Use \"Update generator\" in the Taper section to put it "
+			.. "on RoadHelper's.")
+	end
+
+	local function setTaperAttributes(model: Model, attributes: { [string]: any })
+		setLayoutAttributes(model, attributes)
+		if attributes.TaperBlue or attributes.TaperRed then
+			warnIfGeneratorLacksTaper(model)
+		end
+	end
+
+	-- A segment's tapers as they stand, for restoring them when a drag moves
+	-- back off the neighbour that caused one
+	local function captureTaper(model: Model): { [string]: any }?
+		local info = RoadMath.getSegmentInfo(model)
+		if not info or info.Kind == "Intersection" then
+			return nil
+		end
+		local captured: { [string]: any } = {}
+		for _, prefix in RoadMath.TAPER_ATTRIBUTE_PREFIXES do
+			captured[prefix] = model:GetAttribute(prefix) == true
+			for _, suffix in { "LaneCount", "LaneWidth", "SidewalkWidth", "Length" } do
+				local value = model:GetAttribute(prefix .. suffix)
+				if value ~= nil then
+					captured[prefix .. suffix] = value
+				end
+			end
+		end
+		return captured
+	end
+
+	-- Rebuild one end of a road to `layout`, compensating the bounds so both
+	-- endpoints stay exactly where they are. Returns whether anything changed.
+	local function applyEndLayout(model: Model, id: RoadMath.EndpointId, layout: RoadMath.LaneLayout): boolean
+		local info = RoadMath.getSegmentInfo(model)
+		if not info or info.Kind == "Intersection" then
+			return false
+		end
+		if RoadMath.layoutsMatch(RoadMath.endLayout(info, id), layout) then
+			return false
+		end
+		local solution = RoadMath.solveWidthChange(
+			info,
+			if id == "Blue" then RoadMath.layoutWidth(layout) else RoadMath.endWidth(info, "Blue"),
+			if id == "Red" then RoadMath.layoutWidth(layout) else RoadMath.endWidth(info, "Red"),
+			info.BaseWidth
+		)
+		setTaperAttributes(model, RoadMath.layoutAttributesForEnd(info, id, layout));
+		(model :: any).Size = solution.Size
+		model:PivotTo(solution.Pivot)
+		return true
+	end
+
+	--[[
+		Change the segment's OWN width, keeping it connected: every end joined
+		to a neighbour tapers back to that neighbour's layout, so the road
+		transitions instead of the neighbours having to change too. Both
+		endpoints stay exactly where they are.
+	]]
+	local function setSegmentLayout(model: Model, layout: RoadMath.LaneLayout)
+		local info = RoadMath.getSegmentInfo(model)
+		if not info or info.Kind == "Intersection" then
+			return
+		end
+		-- Neighbours are read before the change, so the tapers target the
+		-- widths they had rather than anything we have just written
+		local neighbours: { [string]: RoadMath.LaneLayout } = {}
+		for _, id in { "Blue", "Red" } do
+			local endpoint = RoadMath.getEndpoint(info, id :: RoadMath.EndpointId)
+			local partner = partnerOfEndpoint(endpoint)
+			if partner then
+				neighbours[id] = RoadMath.endLayout(partner.Segment, partner.Id)
+			end
+		end
+
+		setLayoutAttributes(model, RoadMath.uniformLayoutAttributes(layout))
+		for id, neighbourLayout in neighbours do
+			local current = RoadMath.getSegmentInfo(model)
+			if current then
+				setTaperAttributes(
+					model,
+					RoadMath.layoutAttributesForEnd(current, id :: RoadMath.EndpointId, neighbourLayout)
+				)
+			end
+		end
+
+		-- Both endpoints keep their positions under the new cross-section
+		local updated = RoadMath.getSegmentInfo(model)
+		if not updated then
+			return
+		end
+		local solution = RoadMath.solveWidthChange(
+			info,
+			RoadMath.endWidth(updated, "Blue"),
+			RoadMath.endWidth(updated, "Red"),
+			updated.BaseWidth
+		);
+		(model :: any).Size = solution.Size
+		model:PivotTo(solution.Pivot)
+	end
+
+	-- Taper a road end to the neighbour it has just been joined to. The
+	-- bounds are left alone here: a drag re-solves them from the new widths
+	-- immediately afterwards.
+	local function taperEndToMate(ref: EndpointRef, mate: RoadMath.Endpoint)
+		local info = RoadMath.getSegmentInfo(ref.Model)
+		if not info or info.Kind == "Intersection" then
+			return
+		end
+		local layout = RoadMath.endLayout(mate.Segment, mate.Id)
+		if RoadMath.layoutsMatch(RoadMath.endLayout(info, ref.Id), layout) then
+			return
+		end
+		setTaperAttributes(ref.Model, RoadMath.layoutAttributesForEnd(info, ref.Id, layout))
+	end
+
 	-- A road end joined to one of an intersection's exits, and which exit
 	type IntersectionConnection = {
 		Ref: EndpointRef,
@@ -663,6 +988,9 @@ local function createRoadSession(plugin: Plugin)
 	-- intersection's other connected roads follow its exits.
 	local moveTargets: { EndpointRef } = {}
 	local moveOriginalAdjust: { [RoadMath.AdjustAxis]: number }? = nil
+	-- The dragged segment's lane layout as it was before any auto taper, so
+	-- that dragging back off a neighbour undoes the taper again
+	local moveOriginalTaper: { [string]: any }? = nil
 	local moveIntersection: {
 		Model: Model,
 		StartPivot: CFrame,
@@ -673,6 +1001,7 @@ local function createRoadSession(plugin: Plugin)
 	local function startMove()
 		moveTargets = {}
 		moveOriginalAdjust = nil
+		moveOriginalTaper = nil
 		moveIntersection = nil
 		local selected = getSelectedEndpoint()
 		if not selected then
@@ -681,6 +1010,7 @@ local function createRoadSession(plugin: Plugin)
 		table.insert(moveTargets, { Model = selected.Segment.Model, Id = selected.Id })
 		if selected.Segment.Kind ~= "Intersection" then
 			moveOriginalAdjust = captureAdjust(moveTargets[1])
+			moveOriginalTaper = captureTaper(selected.Segment.Model)
 		end
 		local partner = getPartnerEndpoint()
 		if partner and partner.Segment.Kind == "Intersection" then
@@ -736,6 +1066,16 @@ local function createRoadSession(plugin: Plugin)
 			end
 			newWorldPosition, snapMate = snapToOpenEndpoint(newWorldPosition, movingModels, nil)
 		end
+		-- Taper before solving: the bounds below are sized from the widths the
+		-- segment ends up with, so the fixed end stays put either way
+		local dragTarget = moveTargets[1]
+		if dragTarget and moveOriginalTaper then
+			if snapMate and autoTaper then
+				taperEndToMate(dragTarget, snapMate)
+			else
+				setLayoutAttributes(dragTarget.Model, moveOriginalTaper)
+			end
+		end
 		for _, target in moveTargets do
 			local info = RoadMath.getSegmentInfo(target.Model)
 			if info then
@@ -766,6 +1106,7 @@ local function createRoadSession(plugin: Plugin)
 	local function endMove()
 		moveTargets = {}
 		moveOriginalAdjust = nil
+		moveOriginalTaper = nil
 		moveIntersection = nil
 		finishRecording()
 		gestureActive = false
@@ -840,13 +1181,20 @@ local function createRoadSession(plugin: Plugin)
 	-- Adding segments
 	--------------------------------------------------------------------------
 
-	-- Scan for a template on demand: this only happens on add clicks, never
-	-- per-frame, so a full workspace scan is acceptable.
-	local function findTemplate(kind: RoadMath.SegmentKind, near: Vector3?): RoadMath.SegmentInfo?
+	-- The nearest segment of a kind, from the models the last walk found. Falls
+	-- back to walking the place when nothing has been cached yet, or when the
+	-- cache holds nothing usable of that kind.
+	local function nearestOf(models: { Model }, kind: RoadMath.SegmentKind, near: Vector3?): RoadMath.SegmentInfo?
 		local best: RoadMath.SegmentInfo? = nil
 		local bestDistance = math.huge
-		for _, segment in RoadMath.findSegments(workspace) do
-			if segment.Kind == kind then
+		for _, model in models do
+			-- Cached models can have been deleted or undone away since; a
+			-- template with no parent would silently produce an unparented road
+			if model.Parent == nil then
+				continue
+			end
+			local segment = RoadMath.getSegmentInfo(model)
+			if segment and segment.Kind == kind then
 				local distance = if near then (segment.Pivot.Position - near).Magnitude else 0
 				if distance < bestDistance then
 					bestDistance = distance
@@ -857,6 +1205,33 @@ local function createRoadSession(plugin: Plugin)
 		return best
 	end
 
+	local function findTemplate(kind: RoadMath.SegmentKind, near: Vector3?): RoadMath.SegmentInfo?
+		local cached = knownSegmentModels
+		if cached then
+			local best = nearestOf(cached, kind, near)
+			if best then
+				return best
+			end
+		end
+		-- Nothing cached of this kind: walk the place, and keep what it finds
+		-- so the next add doesn't have to
+		local models: { Model } = {}
+		for _, segment in RoadMath.findSegments(workspace) do
+			table.insert(models, segment.Model)
+		end
+		knownSegmentModels = models
+		return nearestOf(models, kind, near)
+	end
+
+	-- Keep the cache current as RoadHelper builds roads, so a fresh segment can
+	-- be the template for the next one without another walk
+	local function rememberSegment(model: Model)
+		local cached = knownSegmentModels
+		if cached then
+			table.insert(cached, model)
+		end
+	end
+
 	-- Create a new segment joined to `openEnd`, cloned from a template of the
 	-- right kind with appearance attributes copied from the segment being
 	-- extended. Returns the new model and its far (still open) endpoint id.
@@ -865,25 +1240,16 @@ local function createRoadSession(plugin: Plugin)
 		local width = RoadMath.endpointWidth(openEnd)
 		local kind, joinId, pivot, size = RoadMath.placeNewSegment(openEnd, turn, width)
 
+		-- Prefer the segment being extended (same kind), then the nearest of
+		-- that kind, and only build from the packaged generator when the place
+		-- has none at all
 		local template = if openEnd.Segment.Kind == kind
 			then openEnd.Segment
 			else findTemplate(kind, openEnd.WorldCFrame.Position)
-
-		local newModel: Model?
-		if template then
-			newModel = template.Model:Clone()
-			-- Keep the cloned geometry rather than clearing it: the engine
-			-- only regenerates on change events, so a clone whose parameters
-			-- all end up identical to the template's would otherwise stay
-			-- empty. When anything does change, regeneration replaces the
-			-- folder contents anyway.
-		else
-			-- No segment of this kind anywhere: build one from the packaged
-			-- generator templates
-			newModel = createFallbackSegmentModel(kind)
-		end
+		local newModel = if template
+			then template.Model:Clone()
+			else createSegmentModel(kind, size)
 		if not newModel then
-			warn(`RoadHelper: No {kind} road segment available to use as a template.`)
 			return nil, nil
 		end
 
@@ -893,13 +1259,10 @@ local function createRoadSession(plugin: Plugin)
 				newModel:SetAttribute(name, value)
 			end
 		end
-		if openEnd.Segment.Kind == "Intersection" then
-			-- Translate the extended end's lane layout onto the road's
-			-- lane attributes
-			local axis = if openEnd.Id == "XPlus" or openEnd.Id == "XMinus" then "X" else "Z"
-			newModel:SetAttribute("LaneCount", sourceModel:GetAttribute("LaneCount" .. axis) or 2)
-			newModel:SetAttribute("LaneWidth", sourceModel:GetAttribute("LaneWidth" .. axis) or 24)
-		end
+		-- Lane layout follows the END being extended rather than the segment
+		-- as a whole: the far end of a taper, or an intersection's per-axis
+		-- road, is a different layout than the base attributes carry.
+		setLayoutAttributes(newModel, RoadMath.uniformLayoutAttributes(RoadMath.endLayout(openEnd.Segment, openEnd.Id)))
 		newModel:SetAttribute("Flip", false)
 		for _, axis in ADJUST_AXES do
 			newModel:SetAttribute(RoadMath.adjustAttributeName("Blue", axis), 0)
@@ -922,6 +1285,7 @@ local function createRoadSession(plugin: Plugin)
 		(newModel :: any).Size = size
 		newModel:PivotTo(pivot)
 		newModel.Parent = sourceModel.Parent
+		rememberSegment(newModel)
 
 		-- A plain click on the straight handle should jut straight out of the
 		-- open end's ACTUAL face even when it is angled: both end Dirs already
@@ -950,20 +1314,10 @@ local function createRoadSession(plugin: Plugin)
 	local function createJoinedIntersection(openEnd: RoadMath.Endpoint): Model?
 		local sourceModel = openEnd.Segment.Model
 		local template = findTemplate("Intersection", openEnd.WorldCFrame.Position)
-		local newModel: Model?
-		if template then
-			newModel = template.Model:Clone()
-			-- Keep the cloned geometry rather than clearing it: the engine
-			-- only regenerates on change events, so a clone whose parameters
-			-- all end up identical to the template's would otherwise stay
-			-- empty. When anything does change, regeneration replaces the
-			-- folder contents anyway.
-		else
-			-- No intersection anywhere: build one from the packaged template
-			newModel = createFallbackSegmentModel("Intersection")
-		end
+		local newModel = if template
+			then template.Model:Clone()
+			else createSegmentModel("Intersection")
 		if not newModel then
-			warn("RoadHelper: No RoadIntersection available to use as a template.")
 			return nil
 		end
 		for name, value in sourceModel:GetAttributes() do
@@ -997,6 +1351,7 @@ local function createRoadSession(plugin: Plugin)
 		local exitLocal = Vector3.new(0, -size.Y / 2, -boxSize / 2)
 		newModel:PivotTo(rotation + (openEnd.WorldCFrame.Position - rotation:VectorToWorldSpace(exitLocal)))
 		newModel.Parent = sourceModel.Parent
+		rememberSegment(newModel)
 		return newModel
 	end
 
@@ -1004,6 +1359,7 @@ local function createRoadSession(plugin: Plugin)
 	local addDragRef: EndpointRef? = nil
 	local addSourceRef: EndpointRef? = nil
 	local addDragOriginalAdjust: { [RoadMath.AdjustAxis]: number }? = nil
+	local addDragOriginalTaper: { [string]: any }? = nil
 	local addBeforeSelection: SelectionSnapshot = nil
 	-- Intersection adds can't resize on drag; the whole intersection (and the
 	-- source road's end with it) moves instead
@@ -1047,6 +1403,7 @@ local function createRoadSession(plugin: Plugin)
 		end
 		addDragRef = { Model = newModel, Id = farId }
 		addDragOriginalAdjust = captureAdjust(addDragRef :: any)
+		addDragOriginalTaper = captureTaper(newModel)
 		addSourceRef = { Model = selected.Segment.Model, Id = selected.Id }
 		selectedRef = addDragRef
 		changeSignal:Fire()
@@ -1083,6 +1440,15 @@ local function createRoadSession(plugin: Plugin)
 		-- segment was just added to (that would make it degenerate)
 		local snapMate: RoadMath.Endpoint? = nil
 		worldPosition, snapMate = snapToOpenEndpoint(worldPosition, { ref.Model }, addSourceRef)
+		-- Taper before solving, so the bounds below are sized from the widths
+		-- the new segment ends up with
+		if addDragOriginalTaper then
+			if snapMate and autoTaper then
+				taperEndToMate(ref, snapMate)
+			else
+				setLayoutAttributes(ref.Model, addDragOriginalTaper)
+			end
+		end
 		local info = RoadMath.getSegmentInfo(ref.Model)
 		if info then
 			local ok, err = pcall(function()
@@ -1106,6 +1472,7 @@ local function createRoadSession(plugin: Plugin)
 		addDragRef = nil
 		addSourceRef = nil
 		addDragOriginalAdjust = nil
+		addDragOriginalTaper = nil
 		intersectionAdd = nil
 		if activeRecordingName then
 			pushSelectionHistory(activeRecordingName, addBeforeSelection, snapshotSelection())
@@ -1312,7 +1679,9 @@ local function createRoadSession(plugin: Plugin)
 		end
 		local width = if presetAttributes
 			then presetAttributes.LaneCount * presetAttributes.LaneWidth + 2 * presetAttributes.SidewalkWidth
-			elseif template then template.Width
+			-- A tapered template contributes its blue end's width: the new
+			-- free-standing segment is built untapered
+			elseif template then RoadMath.endWidth(template, "Blue")
 			elseif selected then RoadMath.endpointWidth(selected)
 			else 64
 
@@ -1325,22 +1694,17 @@ local function createRoadSession(plugin: Plugin)
 		end
 		local rotation = CFrame.Angles(0, yaw, 0)
 
+		local size = if kind == "Straight"
+			then Vector3.new(width, 0, math.max(2 * width, RoadMath.MIN_LENGTH))
+			else Vector3.new(2 * width, 0, 2 * width)
+
 		local beforeSelection = snapshotSelection()
 		beginRecording("Add Segment")
-		local newModel: Model?
-		if template then
-			newModel = template.Model:Clone()
-			-- Keep the cloned geometry rather than clearing it: the engine
-			-- only regenerates on change events, so a clone whose parameters
-			-- all end up identical to the template's would otherwise stay
-			-- empty. When anything does change, regeneration replaces the
-			-- folder contents anyway.
-		else
-			newModel = createFallbackSegmentModel(kind)
-		end
+		local newModel = if template
+			then template.Model:Clone()
+			else createSegmentModel(kind, size)
 		if not newModel then
 			finishRecording()
-			warn(`RoadHelper: No {kind} road segment available to use as a template.`)
 			return
 		end
 		if presetAttributes then
@@ -1356,22 +1720,20 @@ local function createRoadSession(plugin: Plugin)
 					newModel:SetAttribute(name, value)
 				end
 			end
-			if selected.Segment.Kind == "Intersection" then
-				local axis = if selected.Id == "XPlus" or selected.Id == "XMinus" then "X" else "Z"
-				newModel:SetAttribute("LaneCount", selected.Segment.Model:GetAttribute("LaneCount" .. axis) or 2)
-				newModel:SetAttribute("LaneWidth", selected.Segment.Model:GetAttribute("LaneWidth" .. axis) or 24)
-			end
+			-- Lane layout follows the selected END: a taper's far end, or an
+			-- intersection's per-axis road, differs from the base attributes
+			setLayoutAttributes(newModel, RoadMath.uniformLayoutAttributes(RoadMath.endLayout(selected.Segment, selected.Id)))
 			width = RoadMath.endpointWidth(selected)
 		end
 		newModel:SetAttribute("Flip", false)
+		-- A free-standing segment is a plain one, whatever the template it
+		-- came from was transitioning between
+		newModel:SetAttribute("TaperBlue", false)
+		newModel:SetAttribute("TaperRed", false)
 		for _, axis in ADJUST_AXES do
 			newModel:SetAttribute(RoadMath.adjustAttributeName("Blue", axis), 0)
 			newModel:SetAttribute(RoadMath.adjustAttributeName("Red", axis), 0)
 		end
-
-		local size = if kind == "Straight"
-			then Vector3.new(width, 0, math.max(2 * width, RoadMath.MIN_LENGTH))
-			else Vector3.new(2 * width, 0, 2 * width)
 
 		-- Center the segment on the point the camera is looking at (the pivot
 		-- is the bounding box center), rather than having it extend away out
@@ -1379,6 +1741,7 @@ local function createRoadSession(plugin: Plugin)
 		;(newModel :: any).Size = size
 		newModel:PivotTo(rotation + target)
 		newModel.Parent = if template then template.Model.Parent else workspace
+		rememberSegment(newModel)
 
 		selectedRef = { Model = newModel, Id = "Red" }
 		if activeRecordingName then
@@ -1550,6 +1913,35 @@ local function createRoadSession(plugin: Plugin)
 			GetRestorableExit = getRestorableExit,
 			RestoreExit = restoreExit,
 		}),
+		TaperHandles.new(draggerContext, {
+			GetEndpoint = function()
+				local endpoint = getSelectedEndpoint()
+				-- Intersections carry a lane layout per road rather than per
+				-- end, so there is nothing to taper between
+				if not endpoint or endpoint.Segment.Kind == "Intersection" then
+					return nil
+				end
+				return endpoint
+			end,
+			StartWidth = function()
+				session.StartWidthDrag()
+			end,
+			ApplyWidth = function(width: number)
+				session.ApplyWidthDrag(width)
+			end,
+			EndWidth = function()
+				session.EndWidthDrag()
+			end,
+			StartLength = function()
+				session.StartTaperLengthDrag()
+			end,
+			ApplyLength = function(length: number)
+				session.ApplyTaperLengthDrag(length)
+			end,
+			EndLength = function()
+				session.EndTaperLengthDrag()
+			end,
+		}),
 		AddHandles.new(draggerContext, {
 			GetOpenEndpoint = function()
 				local endpoint = getSelectedEndpoint()
@@ -1592,6 +1984,15 @@ local function createRoadSession(plugin: Plugin)
 			end,
 		}),
 	}
+
+	-- One scan when the tool opens, deferred so it never lands inside a click
+	task.defer(function()
+		local ok, err = pcall(rescanGenerators)
+		if not ok then
+			warn("RoadHelper: Generator scan failed: " .. tostring(err))
+		end
+		changeSignal:Fire()
+	end)
 
 	local rootElement = Roact.createElement(DraggerToolComponent, {
 		Mouse = plugin:GetMouse(),
@@ -1647,6 +2048,8 @@ local function createRoadSession(plugin: Plugin)
 
 	local undoCn = ChangeHistoryService.OnUndo:Connect(function(waypointName: string)
 		clearStudioSelectionAfterHistory()
+		-- History destroys and recreates segments, so cached models go stale
+		knownSegmentModels = nil
 		local top = undoSelectionStack[#undoSelectionStack]
 		if top and top.Name == waypointName then
 			table.remove(undoSelectionStack)
@@ -1658,6 +2061,8 @@ local function createRoadSession(plugin: Plugin)
 	end)
 	local redoCn = ChangeHistoryService.OnRedo:Connect(function(waypointName: string)
 		clearStudioSelectionAfterHistory()
+		-- History destroys and recreates segments, so cached models go stale
+		knownSegmentModels = nil
 		local top = redoSelectionStack[#redoSelectionStack]
 		if top and top.Name == waypointName then
 			table.remove(redoSelectionStack)
@@ -1680,10 +2085,7 @@ local function createRoadSession(plugin: Plugin)
 			return { Kind = "none" :: "none" }
 		end
 		local partner = getPartnerEndpoint()
-		local laneAxisSuffix = ""
-		if selected.Segment.Kind == "Intersection" then
-			laneAxisSuffix = if selected.Id == "XPlus" or selected.Id == "XMinus" then "X" else "Z"
-		end
+		local layout = RoadMath.endLayout(selected.Segment, selected.Id)
 		return {
 			Kind = if partner then "closed" else "open",
 			SegmentKind = selected.Segment.Kind,
@@ -1696,10 +2098,21 @@ local function createRoadSession(plugin: Plugin)
 			HaveLaneMarkings = selected.Segment.Model:GetAttribute("HaveLaneMarkings") ~= false,
 			TextureLaneMarkings = selected.Segment.Model:GetAttribute("TextureLaneMarkings") == true,
 			MaxAngle = (selected.Segment.Model:GetAttribute("MaxAngle") :: number?) or 10,
-			-- For intersections, the lane layout of the selected end's road
-			LaneCount = (selected.Segment.Model:GetAttribute("LaneCount" .. laneAxisSuffix) :: number?) or 2,
-			LaneWidth = (selected.Segment.Model:GetAttribute("LaneWidth" .. laneAxisSuffix) :: number?) or 24,
-			SidewalkWidth = (selected.Segment.Model:GetAttribute("SidewalkWidth") :: number?) or 8,
+			-- The lane layout of the selected end: the taper layout on a
+			-- tapered road's red end, and the matching road of an intersection
+			LaneCount = layout.LaneCount,
+			LaneWidth = layout.LaneWidth,
+			SidewalkWidth = layout.SidewalkWidth,
+			EndWidth = RoadMath.endpointWidth(selected),
+			SegmentWidth = selected.Segment.BaseWidth or selected.Segment.Width,
+			NeighbourWidth = if partner then RoadMath.endpointWidth(partner) else nil,
+			EndTapered = RoadMath.isEndTapered(selected.Segment, selected.Id),
+			GeneratorCurrent = hasCurrentGenerator(selected.Segment.Model),
+			OutdatedGenerators = outdatedGenerators,
+			TaperLength = select(
+				if selected.Id == "Blue" then 1 else 2,
+				RoadMath.taperLengths(selected.Segment)
+			),
 			IntersectionAngle = (selected.Segment.Model:GetAttribute("IntersectionAngle") :: number?) or 90,
 			CornerRadius = math.round((selected.Segment.Size.X - selected.Segment.Width
 				- 2 * ((selected.Segment.Model:GetAttribute("CrossingWidth") :: number?) or 0)) * 50) / 100,
@@ -1805,19 +2218,215 @@ local function createRoadSession(plugin: Plugin)
 			changeSignal:Fire()
 			return
 		end
-		local layout: { [string]: number } = {
-			LaneCount = (model:GetAttribute("LaneCount") :: number?) or 2,
-			LaneWidth = (model:GetAttribute("LaneWidth") :: number?) or 24,
-			SidewalkWidth = (model:GetAttribute("SidewalkWidth") :: number?) or 8,
-		}
-		layout[name] = value
-		local newWidth = layout.LaneCount * layout.LaneWidth + 2 * layout.SidewalkWidth
+		-- The panel edits the selected END when that end tapers, so the
+		-- transition to the rest of the road is left intact. Otherwise it
+		-- changes the segment's own width, and any ends joined to neighbours
+		-- of the old width taper back to them.
+		local layout = RoadMath.endLayout(selected.Segment, selected.Id)
+		if name == "LaneCount" then
+			layout.LaneCount = value
+		elseif name == "LaneWidth" then
+			layout.LaneWidth = value
+		elseif name == "SidewalkWidth" then
+			layout.SidewalkWidth = value
+		else
+			return
+		end
 		beginRecording("Resize Road")
-		model:SetAttribute(name, value)
-		local solution = RoadMath.solveWidthChange(selected.Segment, newWidth);
-		(model :: any).Size = solution.Size
-		model:PivotTo(solution.Pivot)
+		if RoadMath.isEndTapered(selected.Segment, selected.Id) then
+			applyEndLayout(model, selected.Id, layout)
+		else
+			setSegmentLayout(model, layout)
+		end
 		finishRecording()
+		updateDragger()
+		changeSignal:Fire()
+	end
+
+	-- Taper the selected end to the neighbour it is joined to (the manual
+	-- version of what auto taper does while dragging), keeping both endpoints
+	-- where they are so the joint stays sealed.
+	function session.TaperToNeighbour()
+		local selected = getSelectedEndpoint()
+		local partner = getPartnerEndpoint()
+		if not selected or not partner or selected.Segment.Kind == "Intersection" then
+			return
+		end
+		beginRecording("Taper Road")
+		applyEndLayout(
+			selected.Segment.Model,
+			selected.Id,
+			RoadMath.endLayout(partner.Segment, partner.Id)
+		)
+		finishRecording()
+		updateDragger()
+		changeSignal:Fire()
+	end
+
+	-- Drop the selected end's taper: it goes back to the segment's own width.
+	function session.ClearTaper()
+		local selected = getSelectedEndpoint()
+		if not selected or selected.Segment.Kind == "Intersection" then
+			return
+		end
+		beginRecording("Clear Taper")
+		applyEndLayout(
+			selected.Segment.Model,
+			selected.Id,
+			RoadMath.baseLayout(selected.Segment, selected.Id)
+		)
+		finishRecording()
+		updateDragger()
+		changeSignal:Fire()
+	end
+
+	-- Set the selected end's taper length from the panel
+	function session.SetTaperLength(length: number)
+		local selected = getSelectedEndpoint()
+		if not selected
+			or selected.Segment.Kind == "Intersection"
+			or not RoadMath.isEndTapered(selected.Segment, selected.Id)
+		then
+			return
+		end
+		beginRecording("Taper Length")
+		setLayoutAttributes(
+			selected.Segment.Model,
+			RoadMath.taperLengthAttributes(selected.Id, math.max(length, 0))
+		)
+		finishRecording()
+		updateDragger()
+		changeSignal:Fire()
+	end
+
+
+	-- Swap every road in the place onto the packaged generator, in one
+	-- recording so the whole sweep undoes as a unit.
+	function session.UpgradeAllGenerators()
+		local outdated: { RoadMath.SegmentInfo } = {}
+		scanSegments(function(segment)
+			if not hasCurrentGenerator(segment.Model) then
+				table.insert(outdated, segment)
+			end
+		end)
+		if #outdated == 0 then
+			outdatedGenerators = 0
+			changeSignal:Fire()
+			return
+		end
+		beginRecording("Update Generators")
+		for _, segment in outdated do
+			replaceGenerator(segment.Model, segment.Kind)
+		end
+		finishRecording()
+		rescanGenerators()
+		updateDragger()
+		changeSignal:Fire()
+	end
+
+	-- Put the selected segment on the packaged generator, so features the
+	-- plugin writes (tapering, above all) are actually drawn.
+	function session.UpdateGenerator()
+		local selected = getSelectedEndpoint()
+		if not selected then
+			return
+		end
+		beginRecording("Update Generator")
+		replaceGenerator(selected.Segment.Model, selected.Segment.Kind)
+		finishRecording()
+		rescanGenerators()
+		updateDragger()
+		changeSignal:Fire()
+	end
+
+	function session.SetAutoTaper(enabled: boolean)
+		autoTaper = enabled
+	end
+
+	--------------------------------------------------------------------------
+	-- Width and taper-length drags (TaperHandles)
+	--------------------------------------------------------------------------
+
+	local widthDragModel: Model? = nil
+	local lengthDragRef: EndpointRef? = nil
+
+	function session.StartWidthDrag()
+		local selected = getSelectedEndpoint()
+		if not selected or selected.Segment.Kind == "Intersection" then
+			return
+		end
+		widthDragModel = selected.Segment.Model
+		gestureActive = true
+		beginRecording("Resize Road")
+	end
+
+	-- Widen or narrow the segment to (about) the requested width, snapped to
+	-- whole lanes. The segment's own width changes; every end joined to a
+	-- neighbour tapers back to that neighbour, so the road stays connected
+	-- instead of the neighbours being dragged along with it.
+	function session.ApplyWidthDrag(requestedWidth: number)
+		local model = widthDragModel
+		if not model then
+			return
+		end
+		local info = RoadMath.getSegmentInfo(model)
+		if not info then
+			return
+		end
+		local base = RoadMath.baseLayout(info, "Blue")
+		local roadway = math.max(requestedWidth - 2 * base.SidewalkWidth, base.LaneWidth)
+		local laneCount = math.max(math.round(roadway / base.LaneWidth), 1)
+		if laneCount == base.LaneCount then
+			return
+		end
+		setSegmentLayout(model, {
+			LaneCount = laneCount,
+			LaneWidth = base.LaneWidth,
+			SidewalkWidth = base.SidewalkWidth,
+		})
+		changeSignal:Fire()
+	end
+
+	function session.EndWidthDrag()
+		widthDragModel = nil
+		finishRecording()
+		gestureActive = false
+		updateDragger()
+		changeSignal:Fire()
+	end
+
+	function session.StartTaperLengthDrag()
+		local selected = getSelectedEndpoint()
+		if not selected or selected.Segment.Kind == "Intersection" then
+			return
+		end
+		lengthDragRef = { Model = selected.Segment.Model, Id = selected.Id }
+		gestureActive = true
+		beginRecording("Taper Length")
+	end
+
+	function session.ApplyTaperLengthDrag(length: number)
+		local ref = lengthDragRef
+		if not ref then
+			return
+		end
+		local info = RoadMath.getSegmentInfo(ref.Model)
+		if not info or not RoadMath.isEndTapered(info, ref.Id) then
+			return
+		end
+		local clamped = math.clamp(
+			math.round(length),
+			RoadMath.MIN_TAPER_LENGTH,
+			math.max(RoadMath.segmentLength(info), RoadMath.MIN_TAPER_LENGTH)
+		)
+		setLayoutAttributes(ref.Model, RoadMath.taperLengthAttributes(ref.Id, clamped))
+		changeSignal:Fire()
+	end
+
+	function session.EndTaperLengthDrag()
+		lengthDragRef = nil
+		finishRecording()
+		gestureActive = false
 		updateDragger()
 		changeSignal:Fire()
 	end
@@ -1882,16 +2491,11 @@ local function createRoadSession(plugin: Plugin)
 		local template = findTemplate("Intersection", target)
 		local beforeSelection = snapshotSelection()
 		beginRecording("Add Intersection")
-		local newModel: Model?
-		if template then
-			newModel = template.Model:Clone()
-			-- Keep the cloned geometry (see the other add paths)
-		else
-			newModel = createFallbackSegmentModel("Intersection")
-		end
+		local newModel = if template
+			then template.Model:Clone()
+			else createSegmentModel("Intersection")
 		if not newModel then
 			finishRecording()
-			warn("RoadHelper: No RoadIntersection available to use as a template.")
 			return
 		end
 		if presetAttributes then
@@ -1931,6 +2535,7 @@ local function createRoadSession(plugin: Plugin)
 		;(newModel :: any).Size = Vector3.new(wZ + extra, 0, wX + extra)
 		newModel:PivotTo(CFrame.Angles(0, yaw, 0) + target)
 		newModel.Parent = if template then template.Model.Parent else workspace
+		rememberSegment(newModel)
 
 		selectedRef = { Model = newModel, Id = "ZPlus" }
 		if activeRecordingName then
@@ -1943,6 +2548,7 @@ local function createRoadSession(plugin: Plugin)
 
 	function session.Destroy()
 		sessionAlive = false
+		scanAbandoned = true
 		heartbeatCn:Disconnect()
 		undoCn:Disconnect()
 		redoCn:Disconnect()

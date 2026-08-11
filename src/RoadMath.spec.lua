@@ -22,6 +22,22 @@ local function makeSegment(kind: RoadMath.SegmentKind, size: Vector3, pivot: CFr
 	}
 end
 
+-- A segment which is a different width at each end (see the Taper attributes)
+local function makeTaperedSegment(
+	kind: RoadMath.SegmentKind,
+	size: Vector3,
+	pivot: CFrame,
+	blueWidth: number,
+	redWidth: number,
+	flip: boolean?
+): RoadMath.SegmentInfo
+	local segment = makeSegment(kind, size, pivot, flip)
+	segment.Width = math.max(blueWidth, redWidth)
+	segment.BlueWidth = blueWidth
+	segment.RedWidth = redWidth
+	return segment
+end
+
 local function expectFuzzy(t: TestTypes.TestContext, actual: Vector3, expected: Vector3, epsilon: number?)
 	if not actual:FuzzyEq(expected, epsilon or 0.01) then
 		t.fail(`Expected {expected}, got {actual}`)
@@ -542,6 +558,194 @@ return function(t: TestTypes.TestContext)
 		newSeg.Width = WIDTH - 20
 		expectFuzzy(t, RoadMath.getEndpoint(newSeg, "Blue").WorldCFrame.Position, blue)
 		expectFuzzy(t, RoadMath.getEndpoint(newSeg, "Red").WorldCFrame.Position, red)
+	end)
+
+	--
+	-- Tapering
+	--
+
+	t.test("endWidth: falls back to the segment width when untapered", function()
+		local seg = makeSegment("Straight", Vector3.new(WIDTH, 0, 200), CFrame.identity)
+		t.expect(RoadMath.endWidth(seg, "Blue")).toBe(WIDTH)
+		t.expect(RoadMath.endWidth(seg, "Red")).toBe(WIDTH)
+		t.expect(RoadMath.isTapered(seg)).toBe(false)
+	end)
+
+	t.test("tapered straight endpoints: sway comes off the wider end", function()
+		-- Blue end 64 wide, red end 40; the box has to fit the 64
+		local seg = makeTaperedSegment("Straight", Vector3.new(WIDTH + 60, 0, 200), CFrame.identity, WIDTH, 40)
+		t.expect(RoadMath.isTapered(seg)).toBe(true)
+		local blue, red = RoadMath.getEndpoints(seg)
+		-- sway = (124 - 64)/2 = 30, unchanged by the narrow red end
+		expectFuzzy(t, blue.WorldCFrame.Position, Vector3.new(-30, 0, -100))
+		expectFuzzy(t, red.WorldCFrame.Position, Vector3.new(30, 0, 100))
+		-- Which end is the wide one doesn't move either of them
+		local reversed = makeTaperedSegment("Straight", Vector3.new(WIDTH + 60, 0, 200), CFrame.identity, 40, WIDTH)
+		local blue2, red2 = RoadMath.getEndpoints(reversed)
+		expectFuzzy(t, blue2.WorldCFrame.Position, blue.WorldCFrame.Position)
+		expectFuzzy(t, red2.WorldCFrame.Position, red.WorldCFrame.Position)
+	end)
+
+	t.test("tapered curve endpoints: each end insets by its own half width", function()
+		local seg = makeTaperedSegment("Curve", Vector3.new(120, 0, 120), CFrame.identity, WIDTH, 40)
+		local blue, red = RoadMath.getEndpoints(seg)
+		expectFuzzy(t, blue.WorldCFrame.Position, Vector3.new(-60 + 32, 0, -60))
+		expectFuzzy(t, red.WorldCFrame.Position, Vector3.new(60, 0, 60 - 20))
+		t.expect(RoadMath.endpointWidth(red)).toBe(40)
+	end)
+
+	t.test("solveMove: a tapered curve's fixed endpoint stays put", function()
+		local seg = makeTaperedSegment("Curve", Vector3.new(120, 0, 120), CFrame.identity, WIDTH, 40)
+		local oldBlue = RoadMath.getEndpoint(seg, "Blue").WorldCFrame.Position
+		local target = Vector3.new(100, 0, 30)
+		local solution = RoadMath.solveMove(seg, "Red", target)
+		local newSeg = makeTaperedSegment("Curve", solution.Size, solution.Pivot, WIDTH, 40, solution.Flip)
+		expectFuzzy(t, RoadMath.getEndpoint(newSeg, "Blue").WorldCFrame.Position, oldBlue)
+		expectFuzzy(t, RoadMath.getEndpoint(newSeg, "Red").WorldCFrame.Position, target)
+	end)
+
+	t.test("solveMove: moving a tapered curve's blue end keeps red fixed", function()
+		local seg = makeTaperedSegment("Curve", Vector3.new(120, 0, 120), CFrame.identity, 40, WIDTH)
+		local oldRed = RoadMath.getEndpoint(seg, "Red").WorldCFrame.Position
+		local target = Vector3.new(-90, 0, -80)
+		local solution = RoadMath.solveMove(seg, "Blue", target)
+		local newSeg = makeTaperedSegment("Curve", solution.Size, solution.Pivot, 40, WIDTH, solution.Flip)
+		expectFuzzy(t, RoadMath.getEndpoint(newSeg, "Red").WorldCFrame.Position, oldRed)
+		expectFuzzy(t, RoadMath.getEndpoint(newSeg, "Blue").WorldCFrame.Position, target)
+	end)
+
+	t.test("solveWidthChange: tapering one end of a straight keeps both fixed", function()
+		local seg = makeSegment("Straight", Vector3.new(WIDTH + 40, 10, 200), CFrame.new(30, 5, -20))
+		local blue = RoadMath.getEndpoint(seg, "Blue").WorldCFrame.Position
+		local red = RoadMath.getEndpoint(seg, "Red").WorldCFrame.Position
+		-- Widen just the red end: the box grows to fit it, sway is preserved
+		local solution = RoadMath.solveWidthChange(seg, WIDTH, WIDTH + 24)
+		local newSeg = makeTaperedSegment("Straight", solution.Size, solution.Pivot, WIDTH, WIDTH + 24)
+		expectFuzzy(t, RoadMath.getEndpoint(newSeg, "Blue").WorldCFrame.Position, blue)
+		expectFuzzy(t, RoadMath.getEndpoint(newSeg, "Red").WorldCFrame.Position, red)
+	end)
+
+	t.test("solveWidthChange: tapering one end of a curve keeps both fixed", function()
+		local pivot = CFrame.new(50, 0, 10) * CFrame.Angles(0, math.rad(30), 0)
+		local seg = makeSegment("Curve", Vector3.new(140, 0, 140), pivot)
+		local blue = RoadMath.getEndpoint(seg, "Blue").WorldCFrame.Position
+		local red = RoadMath.getEndpoint(seg, "Red").WorldCFrame.Position
+		-- Narrow only the red end
+		local solution = RoadMath.solveWidthChange(seg, WIDTH, WIDTH - 24)
+		local newSeg = makeTaperedSegment("Curve", solution.Size, solution.Pivot, WIDTH, WIDTH - 24)
+		expectFuzzy(t, RoadMath.getEndpoint(newSeg, "Blue").WorldCFrame.Position, blue)
+		expectFuzzy(t, RoadMath.getEndpoint(newSeg, "Red").WorldCFrame.Position, red)
+	end)
+
+	t.test("solveWidthChange: narrowing a taper back to one width keeps both fixed", function()
+		local pivot = CFrame.new(-12, 3, 40) * CFrame.Angles(0, math.rad(-70), 0)
+		local seg = makeTaperedSegment("Curve", Vector3.new(150, 0, 130), pivot, WIDTH + 20, WIDTH)
+		local blue = RoadMath.getEndpoint(seg, "Blue").WorldCFrame.Position
+		local red = RoadMath.getEndpoint(seg, "Red").WorldCFrame.Position
+		local solution = RoadMath.solveWidthChange(seg, WIDTH, WIDTH)
+		local newSeg = makeSegment("Curve", solution.Size, solution.Pivot)
+		newSeg.Width = WIDTH
+		expectFuzzy(t, RoadMath.getEndpoint(newSeg, "Blue").WorldCFrame.Position, blue)
+		expectFuzzy(t, RoadMath.getEndpoint(newSeg, "Red").WorldCFrame.Position, red)
+	end)
+
+	t.test("endLayout: reads the taper layout for the red end only", function()
+		local seg = makeSegment("Straight", Vector3.new(WIDTH, 0, 200), CFrame.identity)
+		local attrs = (seg.Model :: any).attrs
+		attrs.LaneCount = 4
+		attrs.LaneWidth = 20
+		attrs.SidewalkWidth = 6
+		attrs.TaperRed = true
+		attrs.TaperRedLaneCount = 2
+		local blue = RoadMath.endLayout(seg, "Blue")
+		t.expect(blue.LaneCount).toBe(4)
+		t.expect(RoadMath.layoutWidth(blue)).toBe(4 * 20 + 12)
+		-- Unset taper values fall back to the segment's own layout
+		local red = RoadMath.endLayout(seg, "Red")
+		t.expect(red.LaneCount).toBe(2)
+		t.expect(red.LaneWidth).toBe(20)
+		t.expect(red.SidewalkWidth).toBe(6)
+		-- Each end tapers independently of the other
+		attrs.TaperBlue = true
+		attrs.TaperBlueLaneCount = 6
+		t.expect(RoadMath.endLayout(seg, "Blue").LaneCount).toBe(6)
+		t.expect(RoadMath.endLayout(seg, "Red").LaneCount).toBe(2)
+		-- Switching an end's taper off returns it to the segment's own layout
+		attrs.TaperBlue = false
+		attrs.TaperRed = false
+		t.expect(RoadMath.endLayout(seg, "Blue").LaneCount).toBe(4)
+		t.expect(RoadMath.endLayout(seg, "Red").LaneCount).toBe(4)
+	end)
+
+	t.test("taperLengths: default to half the road and never overlap", function()
+		local seg = makeSegment("Straight", Vector3.new(WIDTH, 0, 200), CFrame.identity)
+		local attrs = (seg.Model :: any).attrs
+		t.expect(select(1, RoadMath.taperLengths(seg))).toBe(0)
+
+		-- Unset length means half the segment
+		attrs.TaperRed = true
+		attrs.TaperRedLaneCount = 4
+		local _, red = RoadMath.taperLengths(seg)
+		t.expect(red).toBe(100)
+
+		-- Two tapers asking for more than the road has are scaled to fit
+		attrs.TaperBlue = true
+		attrs.TaperBlueLaneCount = 1
+		attrs.TaperBlueLength = 300
+		attrs.TaperRedLength = 100
+		local blueLength, redLength = RoadMath.taperLengths(seg)
+		t.expect(math.abs(blueLength + redLength - 200) < 0.001).toBe(true)
+		t.expect(blueLength > redLength).toBe(true)
+	end)
+
+	t.test("layoutAttributesForEnd: never rewrites the segment's own layout", function()
+		local seg = makeSegment("Straight", Vector3.new(WIDTH, 0, 200), CFrame.identity)
+		local attrs = (seg.Model :: any).attrs
+		attrs.LaneCount = 2
+		attrs.LaneWidth = 24
+		attrs.SidewalkWidth = 8
+		local wide = { LaneCount = 4, LaneWidth = 24, SidewalkWidth = 8 }
+
+		-- Whichever end is retargeted, LaneCount/LaneWidth/SidewalkWidth are
+		-- left alone: a taper must never read as a resize of the whole road
+		for _, id in { "Blue", "Red" } do
+			local prefix = RoadMath.TAPER_ATTRIBUTE_PREFIXES[id]
+			local attributes = RoadMath.layoutAttributesForEnd(seg, id :: RoadMath.EndpointId, wide)
+			t.expect(attributes.LaneCount == nil).toBe(true)
+			t.expect(attributes.LaneWidth == nil).toBe(true)
+			t.expect(attributes.SidewalkWidth == nil).toBe(true)
+			t.expect(attributes[prefix]).toBe(true)
+			t.expect(attributes[prefix .. "LaneCount"]).toBe(4)
+			-- A fresh taper gets a length proportional to the width change
+			t.expect(attributes[prefix .. "Length"] > 0).toBe(true)
+			-- ...and the other end is left entirely alone
+			local otherPrefix = RoadMath.TAPER_ATTRIBUTE_PREFIXES[if id == "Blue" then "Red" else "Blue"]
+			t.expect(attributes[otherPrefix] == nil).toBe(true)
+		end
+
+		-- Retargeting an end back to the segment's own layout drops the taper
+		local same = RoadMath.layoutAttributesForEnd(seg, "Red", { LaneCount = 2, LaneWidth = 24, SidewalkWidth = 8 })
+		t.expect(same.TaperRed).toBe(false)
+	end)
+
+	t.test("swappedTaperValues: the taper follows its geographic end", function()
+		local seg = makeTaperedSegment("Straight", Vector3.new(WIDTH, 0, 200), CFrame.identity, 64, 40)
+		local attrs = (seg.Model :: any).attrs
+		attrs.LaneCount = 2
+		attrs.LaneWidth = 24
+		attrs.SidewalkWidth = 8
+		attrs.TaperRed = true
+		attrs.TaperRedLaneCount = 1
+		attrs.TaperRedLength = 40
+		local swapped = RoadMath.swappedTaperValues(seg)
+		assert(swapped)
+		-- The red end's taper becomes the blue end's, values and all
+		t.expect(swapped.TaperBlue).toBe(true)
+		t.expect(swapped.TaperBlueLaneCount).toBe(1)
+		t.expect(swapped.TaperBlueLength).toBe(40)
+		t.expect(swapped.TaperRed).toBe(false)
+		-- An untapered segment has nothing to swap
+		t.expect(RoadMath.swappedTaperValues(makeSegment("Straight", Vector3.new(WIDTH, 0, 200), CFrame.identity)) == nil).toBe(true)
 	end)
 
 	t.test("placeNewSegment: aligns to the nominal frame despite end Dir", function()
