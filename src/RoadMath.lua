@@ -602,6 +602,40 @@ function RoadMath.solveMove(segment: SegmentInfo, movedId: EndpointId, newWorldP
 		-- blue->red delta in the rotated frame: X and Z negate twice (once
 		-- from reversing the ends, once from the 180 rotation), Y negates once
 		delta = Vector3.new(delta.X, -delta.Y, delta.Z)
+	elseif segment.Kind == "Curve" then
+		-- A curve is a quarter turn of fixed handedness: travelling blue ->
+		-- red always bends the same way, so the corner only reaches the side
+		-- of the fixed end that the moved end started on. The opposite turn
+		-- is the SAME corner driven the other way round, so when the moved
+		-- end crosses the line the fixed end looks along, trade the ends'
+		-- roles and yaw the box a quarter turn to suit. Which quarter: the
+		-- fixed end keeps its exact position and outward direction, and blue
+		-- looks -Z where red looks +X, so the two directions of the trade are
+		-- opposite quarter turns.
+		-- The component to test is the one across the fixed end's own travel
+		-- direction; the other going negative puts the moved end BEHIND the
+		-- fixed one, which no quarter turn reaches either way.
+		local crossedOver = if fixedId == "Blue" then delta.X < 0 else delta.Z < 0
+		if crossedOver then
+			swapEnds = true
+			rotation = rotation * CFrame.Angles(0, if fixedId == "Blue" then math.pi / 2 else -math.pi / 2, 0)
+			movedId, fixedId = fixedId, movedId
+			-- The fixed end hasn't moved, only changed colour, so the delta
+			-- re-derives from the same world points in the new frame
+			delta = rotation:VectorToObjectSpace(newWorldPosition - fixedWorld)
+			if movedId == "Blue" then
+				delta = -delta
+			end
+		end
+	end
+
+	-- Each end's width follows its geographic end through a swap (the taper
+	-- attributes are traded to match, see swappedTaperValues), so read them
+	-- against the colours the ends are about to have
+	local blueWidth = RoadMath.endWidth(segment, "Blue")
+	local redWidth = RoadMath.endWidth(segment, "Red")
+	if swapEnds then
+		blueWidth, redWidth = redWidth, blueWidth
 	end
 
 	local width = segment.Width
@@ -621,9 +655,9 @@ function RoadMath.solveMove(segment: SegmentInfo, movedId: EndpointId, newWorldP
 		-- that face carries. Flip selects which end is the top.
 		newFlip = delta.Y < 0
 		newSize = Vector3.new(
-			math.max(delta.X + RoadMath.endWidth(segment, "Blue") / 2, width),
+			math.max(delta.X + blueWidth / 2, width),
 			math.abs(delta.Y),
-			math.max(delta.Z + RoadMath.endWidth(segment, "Red") / 2, width)
+			math.max(delta.Z + redWidth / 2, width)
 		)
 	end
 
@@ -634,7 +668,7 @@ function RoadMath.solveMove(segment: SegmentInfo, movedId: EndpointId, newWorldP
 		width,
 		newFlip,
 		fixedId,
-		RoadMath.endWidth(segment, fixedId)
+		if fixedId == "Blue" then blueWidth else redWidth
 	)
 	local pivotPosition = fixedWorld - rotation:VectorToWorldSpace(newLocalFixed.Position)
 	return {
