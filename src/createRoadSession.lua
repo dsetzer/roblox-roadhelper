@@ -80,6 +80,8 @@ export type SelectionState = {
 	-- Whether the segment is running RoadHelper's own generator, which is what
 	-- decides whether the features the plugin writes get drawn at all
 	GeneratorCurrent: boolean,
+	-- How many segments in the place are still on an older generator
+	OutdatedGenerators: number,
 	IntersectionAngle: number,
 	-- Nominal corner curve radius of an intersection (half the bounding box
 	-- size in excess of the roads' widths and crosswalks; exact at 90 degrees)
@@ -153,17 +155,19 @@ local GENERATOR_MODULE_NAMES: { [RoadMath.SegmentKind]: string } = {
 }
 
 --[[
-	Every segment RoadHelper builds gets the generator packaged inside the
-	plugin, never a copy of some neighbour's.
+	New segments are cloned from an existing one where there is one to clone,
+	and built from the packaged generator only when the place has none of that
+	kind yet.
 
-	A generator is a child ModuleScript of each segment, so a place holds one
-	copy per road — copies which nothing ever updates. Cloning a neighbour
-	therefore spreads whatever version that neighbour happened to carry, and
-	leaves RoadHelper unable to rely on any attribute it writes being
-	understood. The plugin's copy is the one that actually gets maintained, so
-	it is the one new roads are built from; the look still comes from the road
-	being extended, whose attributes are copied onto the new model BEFORE it is
-	parented, so it generates once, already correct.
+	Cloning inherits a generator that is already loaded and running, which
+	keeps a fresh module load — and every way one can fail — off the path that
+	adding a road takes. The cost is that a clone carries whatever generator
+	version its neighbour had, so it may not implement tapering; generators
+	RoadHelper installs are stamped, and "Update generator" swaps a segment
+	onto the packaged one.
+
+	Either way the appearance attributes are copied onto the new model BEFORE
+	it is parented, so it generates once, already correct.
 ]]
 local Templates = script.Parent.Templates
 -- Stamped on generators RoadHelper installs, so a segment carrying an older
@@ -218,7 +222,7 @@ local function hasCurrentGenerator(model: Model): boolean
 	return generator:GetAttribute(GENERATOR_MARKER) == GENERATOR_VERSION
 end
 
-local function createSegmentModel(kind: RoadMath.SegmentKind): Model?
+local function createSegmentModel(kind: RoadMath.SegmentKind, size: Vector3?): Model?
 	local ok, model = pcall(function()
 		return Instance.new("ProceduralModel" :: any) :: any
 	end)
@@ -230,6 +234,12 @@ local function createSegmentModel(kind: RoadMath.SegmentKind): Model?
 		then "StraightRoad"
 		elseif kind == "Curve" then "CurveRoad"
 		else "RoadIntersection"
+	-- Size before the generator is bound: a fresh ProceduralModel carries a
+	-- default size, and binding the generator to that would have it generate
+	-- once at a shape nobody asked for before the real one is applied.
+	if size then
+		model.Size = size
+	end
 	if not installGenerator(model, kind) then
 		warn(`RoadHelper: The packaged {kind} generator is missing from the plugin.`)
 		model:Destroy()
@@ -1121,7 +1131,15 @@ local function createRoadSession(plugin: Plugin)
 		local width = RoadMath.endpointWidth(openEnd)
 		local kind, joinId, pivot, size = RoadMath.placeNewSegment(openEnd, turn, width)
 
-		local newModel = createSegmentModel(kind)
+		-- Prefer the segment being extended (same kind), then the nearest of
+		-- that kind, and only build from the packaged generator when the place
+		-- has none at all
+		local template = if openEnd.Segment.Kind == kind
+			then openEnd.Segment
+			else findTemplate(kind, openEnd.WorldCFrame.Position)
+		local newModel = if template
+			then template.Model:Clone()
+			else createSegmentModel(kind, size)
 		if not newModel then
 			return nil, nil
 		end
@@ -1185,7 +1203,10 @@ local function createRoadSession(plugin: Plugin)
 	-- layout matching the road on both of its axes.
 	local function createJoinedIntersection(openEnd: RoadMath.Endpoint): Model?
 		local sourceModel = openEnd.Segment.Model
-		local newModel = createSegmentModel("Intersection")
+		local template = findTemplate("Intersection", openEnd.WorldCFrame.Position)
+		local newModel = if template
+			then template.Model:Clone()
+			else createSegmentModel("Intersection")
 		if not newModel then
 			return nil
 		end
@@ -1562,21 +1583,18 @@ local function createRoadSession(plugin: Plugin)
 		end
 		local rotation = CFrame.Angles(0, yaw, 0)
 
+		local size = if kind == "Straight"
+			then Vector3.new(width, 0, math.max(2 * width, RoadMath.MIN_LENGTH))
+			else Vector3.new(2 * width, 0, 2 * width)
+
 		local beforeSelection = snapshotSelection()
 		beginRecording("Add Segment")
-		local newModel = createSegmentModel(kind)
+		local newModel = if template
+			then template.Model:Clone()
+			else createSegmentModel(kind, size)
 		if not newModel then
 			finishRecording()
 			return
-		end
-		-- The nearby segment is an appearance source only; the geometry comes
-		-- from the packaged generator
-		if template then
-			for name, value in template.Model:GetAttributes() do
-				if not GEOMETRY_ATTRIBUTES[name] then
-					newModel:SetAttribute(name, value)
-				end
-			end
 		end
 		if presetAttributes then
 			-- The preset decides the appearance outright
@@ -1605,10 +1623,6 @@ local function createRoadSession(plugin: Plugin)
 			newModel:SetAttribute(RoadMath.adjustAttributeName("Blue", axis), 0)
 			newModel:SetAttribute(RoadMath.adjustAttributeName("Red", axis), 0)
 		end
-
-		local size = if kind == "Straight"
-			then Vector3.new(width, 0, math.max(2 * width, RoadMath.MIN_LENGTH))
-			else Vector3.new(2 * width, 0, 2 * width)
 
 		-- Center the segment on the point the camera is looking at (the pivot
 		-- is the bounding box center), rather than having it extend away out
@@ -1859,6 +1873,15 @@ local function createRoadSession(plugin: Plugin)
 		}),
 	}
 
+	-- One scan when the tool opens, deferred so it never lands inside a click
+	task.defer(function()
+		local ok, err = pcall(rescanGenerators)
+		if not ok then
+			warn("RoadHelper: Generator scan failed: " .. tostring(err))
+		end
+		changeSignal:Fire()
+	end)
+
 	local rootElement = Roact.createElement(DraggerToolComponent, {
 		Mouse = plugin:GetMouse(),
 		DraggerContext = draggerContext,
@@ -1969,6 +1992,7 @@ local function createRoadSession(plugin: Plugin)
 			NeighbourWidth = if partner then RoadMath.endpointWidth(partner) else nil,
 			EndTapered = RoadMath.isEndTapered(selected.Segment, selected.Id),
 			GeneratorCurrent = hasCurrentGenerator(selected.Segment.Model),
+			OutdatedGenerators = outdatedGenerators,
 			TaperLength = select(
 				if selected.Id == "Blue" then 1 else 2,
 				RoadMath.taperLengths(selected.Segment)
@@ -2159,6 +2183,49 @@ local function createRoadSession(plugin: Plugin)
 		changeSignal:Fire()
 	end
 
+	--[[
+		Roads made before the taper update carry a generator that predates it,
+		and no amount of attribute setting makes such a generator draw a taper
+		— the transition is code, not a parameter. They can't be detected by
+		reading the module (that needs script injection permission), so the
+		test is whether RoadHelper installed the generator itself: anything
+		unstamped is treated as possibly outdated and offered an upgrade.
+	]]
+	local outdatedGenerators = 0
+	local function rescanGenerators()
+		local count = 0
+		for _, segment in RoadMath.findSegments(workspace) do
+			if not hasCurrentGenerator(segment.Model) then
+				count += 1
+			end
+		end
+		outdatedGenerators = count
+	end
+
+	-- Swap every road in the place onto the packaged generator, in one
+	-- recording so the whole sweep undoes as a unit.
+	function session.UpgradeAllGenerators()
+		local outdated: { RoadMath.SegmentInfo } = {}
+		for _, segment in RoadMath.findSegments(workspace) do
+			if not hasCurrentGenerator(segment.Model) then
+				table.insert(outdated, segment)
+			end
+		end
+		if #outdated == 0 then
+			outdatedGenerators = 0
+			changeSignal:Fire()
+			return
+		end
+		beginRecording("Update Generators")
+		for _, segment in outdated do
+			replaceGenerator(segment.Model, segment.Kind)
+		end
+		finishRecording()
+		rescanGenerators()
+		updateDragger()
+		changeSignal:Fire()
+	end
+
 	-- Put the selected segment on the packaged generator, so features the
 	-- plugin writes (tapering, above all) are actually drawn.
 	function session.UpdateGenerator()
@@ -2169,6 +2236,7 @@ local function createRoadSession(plugin: Plugin)
 		beginRecording("Update Generator")
 		replaceGenerator(selected.Segment.Model, selected.Segment.Kind)
 		finishRecording()
+		rescanGenerators()
 		updateDragger()
 		changeSignal:Fire()
 	end
@@ -2325,17 +2393,12 @@ local function createRoadSession(plugin: Plugin)
 		local template = findTemplate("Intersection", target)
 		local beforeSelection = snapshotSelection()
 		beginRecording("Add Intersection")
-		local newModel = createSegmentModel("Intersection")
+		local newModel = if template
+			then template.Model:Clone()
+			else createSegmentModel("Intersection")
 		if not newModel then
 			finishRecording()
 			return
-		end
-		if template then
-			for name, value in template.Model:GetAttributes() do
-				if not GEOMETRY_ATTRIBUTES[name] then
-					newModel:SetAttribute(name, value)
-				end
-			end
 		end
 		if presetAttributes then
 			-- The preset's road lane layout maps onto both of the

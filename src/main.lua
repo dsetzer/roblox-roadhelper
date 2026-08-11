@@ -126,6 +126,11 @@ return function(plugin: Plugin, panel: DockWidgetPluginGui, buttonClicked: Signa
 						session.UpdateGenerator()
 					end
 				end,
+				UpgradeAllGenerators = function()
+					if session then
+						session.UpgradeAllGenerators()
+					end
+				end,
 				AddSegment = function(kind: RoadMath.SegmentKind)
 					if session then
 						local preset = Presets.ByKey[activeSettings.SelectedPreset]
