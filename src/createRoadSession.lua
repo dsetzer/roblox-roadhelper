@@ -729,6 +729,25 @@ local function createRoadSession(plugin: Plugin)
 	-- between the two instead of stepping. Off, ends just butt together.
 	local autoTaper = true
 
+	--[[
+		Roads made before the taper update carry a generator that predates it,
+		and no amount of attribute setting makes such a generator draw a taper
+		— the transition is code, not a parameter. They can't be detected by
+		reading the module (that needs script injection permission), so the
+		test is whether RoadHelper installed the generator itself: anything
+		unstamped is treated as possibly outdated and offered an upgrade.
+	]]
+	local outdatedGenerators = 0
+	local function rescanGenerators()
+		local count = 0
+		for _, segment in RoadMath.findSegments(workspace) do
+			if not hasCurrentGenerator(segment.Model) then
+				count += 1
+			end
+		end
+		outdatedGenerators = count
+	end
+
 	local function setLayoutAttributes(model: Model, attributes: { [string]: any })
 		for name, value in attributes do
 			if model:GetAttribute(name) ~= value then
@@ -2183,24 +2202,6 @@ local function createRoadSession(plugin: Plugin)
 		changeSignal:Fire()
 	end
 
-	--[[
-		Roads made before the taper update carry a generator that predates it,
-		and no amount of attribute setting makes such a generator draw a taper
-		— the transition is code, not a parameter. They can't be detected by
-		reading the module (that needs script injection permission), so the
-		test is whether RoadHelper installed the generator itself: anything
-		unstamped is treated as possibly outdated and offered an upgrade.
-	]]
-	local outdatedGenerators = 0
-	local function rescanGenerators()
-		local count = 0
-		for _, segment in RoadMath.findSegments(workspace) do
-			if not hasCurrentGenerator(segment.Model) then
-				count += 1
-			end
-		end
-		outdatedGenerators = count
-	end
 
 	-- Swap every road in the place onto the packaged generator, in one
 	-- recording so the whole sweep undoes as a unit.
