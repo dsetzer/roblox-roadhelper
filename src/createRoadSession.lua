@@ -738,14 +738,54 @@ local function createRoadSession(plugin: Plugin)
 		unstamped is treated as possibly outdated and offered an upgrade.
 	]]
 	local outdatedGenerators = 0
+	-- Set when the session is torn down, so a scan in flight gives up rather
+	-- than walking a workspace nobody is looking at any more
+	local scanAbandoned = false
+
+	--[[
+		Walk the workspace for segments, yielding as it goes.
+
+		A real place holds far more instances than a test one, and doing this in
+		a single pass blocks Studio for as long as it takes. The visit is
+		therefore budgeted: every SCAN_BUDGET instances it yields a frame, so a
+		big place costs a moment of background work rather than a freeze.
+	]]
+	local SCAN_BUDGET = 500
+	local function scanSegments(onSegment: (RoadMath.SegmentInfo) -> ())
+		local budget = SCAN_BUDGET
+		local function visit(container: Instance)
+			for _, child in container:GetChildren() do
+				if scanAbandoned then
+					return
+				end
+				budget -= 1
+				if budget <= 0 then
+					budget = SCAN_BUDGET
+					task.wait()
+				end
+				local info = RoadMath.getSegmentInfo(child)
+				if info then
+					onSegment(info)
+				elseif not child:IsA("BasePart") then
+					-- Segments never contain segments, and BaseParts never
+					-- contain either, so neither is worth descending into
+					visit(child)
+				end
+			end
+		end
+		visit(workspace)
+	end
+
 	local function rescanGenerators()
 		local count = 0
-		for _, segment in RoadMath.findSegments(workspace) do
+		scanSegments(function(segment)
 			if not hasCurrentGenerator(segment.Model) then
 				count += 1
 			end
+		end)
+		if not scanAbandoned then
+			outdatedGenerators = count
 		end
-		outdatedGenerators = count
 	end
 
 	local function setLayoutAttributes(model: Model, attributes: { [string]: any })
@@ -2207,11 +2247,11 @@ local function createRoadSession(plugin: Plugin)
 	-- recording so the whole sweep undoes as a unit.
 	function session.UpgradeAllGenerators()
 		local outdated: { RoadMath.SegmentInfo } = {}
-		for _, segment in RoadMath.findSegments(workspace) do
+		scanSegments(function(segment)
 			if not hasCurrentGenerator(segment.Model) then
 				table.insert(outdated, segment)
 			end
-		end
+		end)
 		if #outdated == 0 then
 			outdatedGenerators = 0
 			changeSignal:Fire()
@@ -2450,6 +2490,7 @@ local function createRoadSession(plugin: Plugin)
 
 	function session.Destroy()
 		sessionAlive = false
+		scanAbandoned = true
 		heartbeatCn:Disconnect()
 		undoCn:Disconnect()
 		redoCn:Disconnect()
