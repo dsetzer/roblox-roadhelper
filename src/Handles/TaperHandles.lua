@@ -64,7 +64,11 @@ function TaperHandles:update(draggerToolModel, selectionInfo)
 		return
 	end
 	local segment = endpoint.Segment
-	local frame = endpoint.WorldCFrame
+	-- The end's ACTUAL face, not its nominal box frame: endpoint positions are
+	-- invariant under the Adjust angles, so the nominal frame doesn't turn when
+	-- the end is rotated and these handles would keep the road's original
+	-- heading. The move and rotate handles align the same way.
+	local frame = RoadMath.actualEndpointFrame(endpoint)
 	local scale = self._draggerContext:getHandleScale(frame.Position)
 	-- Lateral axis of the end face, and the direction back into the segment
 	local lateral = frame.LookVector:Cross(frame.UpVector)
