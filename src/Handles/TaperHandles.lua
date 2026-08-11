@@ -1,7 +1,8 @@
 --[[
 	TaperHandles: the two edits a taper needs, on the selected road endpoint.
 
-	- Width handles sit on each side of the end face. Dragging one sideways
+	- Width handles are the balls on each side of the end face (round, so they
+	  don't read as more of the cone-shaped add handles). Dragging one sideways
 	  widens or narrows the SEGMENT (snapped to whole lanes); the session
 	  tapers whichever of its ends are joined to neighbours back to those
 	  neighbours, so changing a road's width doesn't drag the rest of the road
@@ -128,12 +129,12 @@ function TaperHandles:render(hoveredHandleId)
 		local hovered = handleId == hoveredHandleId or handleId == self._draggingHandleId
 		local size = MARKER_SIZE * handle.Scale * (if hovered then 1.25 else 1)
 		if handle.Kind == "Width" then
-			-- A flat outward-pointing wedge: it reads as "drag me sideways"
-			children[handleId] = Roact.createElement("ConeHandleAdornment", {
+			-- A ball rather than a cone: the add handles are cones, and these
+			-- do something quite different, so they shouldn't look alike
+			children[handleId] = Roact.createElement("SphereHandleAdornment", {
 				Adornee = workspace.Terrain,
-				CFrame = CFrame.lookAlong(handle.Position - handle.Axis * (size * 0.6), handle.Axis),
-				Height = size * 1.4,
-				Radius = size * 0.5,
+				CFrame = CFrame.new(handle.Position),
+				Radius = size * 0.55,
 				Color3 = handle.Color,
 				Transparency = if hovered then 0 else 0.3,
 				AlwaysOnTop = false,
