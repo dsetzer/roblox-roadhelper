@@ -232,6 +232,78 @@ return function(t: TestTypes.TestContext)
 		t.expect(solution.Size.Z >= WIDTH).toBe(true)
 	end)
 
+	t.test("solveMove curve: dragging the red end across turns the corner the other way", function()
+		-- Blue enters at (-28, 0, -60) heading +Z, red exits +X: a right turn
+		local seg = makeSegment("Curve", Vector3.new(120, 0, 120), CFrame.identity)
+		local blue = RoadMath.getEndpoint(seg, "Blue").WorldCFrame
+		local target = Vector3.new(-150, 0, 40) -- the far side of blue's entry axis
+		local solution = RoadMath.solveMove(seg, "Red", target)
+		t.expect(solution.SwapEnds).toBe(true)
+		-- The ends have traded colours, so the dragged end is now the blue one
+		local newSeg = makeSegment("Curve", solution.Size, solution.Pivot, solution.Flip)
+		expectFuzzy(t, RoadMath.getEndpoint(newSeg, "Blue").WorldCFrame.Position, target)
+		-- The joint the corner hangs off must not move OR turn
+		local anchor = RoadMath.getEndpoint(newSeg, "Red").WorldCFrame
+		expectFuzzy(t, anchor.Position, blue.Position)
+		expectFuzzy(t, anchor.LookVector, blue.LookVector)
+	end)
+
+	t.test("solveMove curve: dragging the blue end across turns the corner the other way", function()
+		local seg = makeSegment("Curve", Vector3.new(120, 0, 120), CFrame.identity)
+		local red = RoadMath.getEndpoint(seg, "Red").WorldCFrame
+		local target = Vector3.new(-28, 0, 150) -- the far side of red's exit axis
+		local solution = RoadMath.solveMove(seg, "Blue", target)
+		t.expect(solution.SwapEnds).toBe(true)
+		local newSeg = makeSegment("Curve", solution.Size, solution.Pivot, solution.Flip)
+		expectFuzzy(t, RoadMath.getEndpoint(newSeg, "Red").WorldCFrame.Position, target)
+		local anchor = RoadMath.getEndpoint(newSeg, "Blue").WorldCFrame
+		expectFuzzy(t, anchor.Position, red.Position)
+		expectFuzzy(t, anchor.LookVector, red.LookVector)
+	end)
+
+	t.test("solveMove curve: turning the other way holds a rotated joint", function()
+		local pivot = CFrame.new(300, 12, -75) * CFrame.Angles(0, math.rad(37), 0)
+		local seg = makeSegment("Curve", Vector3.new(120, 0, 120), pivot)
+		local blue = RoadMath.getEndpoint(seg, "Blue").WorldCFrame
+		local target = (pivot * CFrame.new(-150, 0, 40)).Position
+		local solution = RoadMath.solveMove(seg, "Red", target)
+		t.expect(solution.SwapEnds).toBe(true)
+		local newSeg = makeSegment("Curve", solution.Size, solution.Pivot, solution.Flip)
+		expectFuzzy(t, RoadMath.getEndpoint(newSeg, "Blue").WorldCFrame.Position, target)
+		local anchor = RoadMath.getEndpoint(newSeg, "Red").WorldCFrame
+		expectFuzzy(t, anchor.Position, blue.Position)
+		expectFuzzy(t, anchor.LookVector, blue.LookVector)
+	end)
+
+	t.test("solveMove curve: turning the other way carries each end's taper width", function()
+		-- The wide end is the blue one; after the swap it is the red one, so
+		-- the solve has to size the box against the traded widths
+		local seg = makeTaperedSegment("Curve", Vector3.new(136, 0, 136), CFrame.identity, 96, WIDTH)
+		local blue = RoadMath.getEndpoint(seg, "Blue").WorldCFrame
+		local target = Vector3.new(-150, 0, 40)
+		local solution = RoadMath.solveMove(seg, "Red", target)
+		t.expect(solution.SwapEnds).toBe(true)
+		-- The taper follows its geographic end (see swappedTaperValues), so the
+		-- end that was 96 wide still is
+		local newSeg = makeTaperedSegment("Curve", solution.Size, solution.Pivot, WIDTH, 96)
+		expectFuzzy(t, RoadMath.getEndpoint(newSeg, "Blue").WorldCFrame.Position, target)
+		local anchor = RoadMath.getEndpoint(newSeg, "Red").WorldCFrame
+		expectFuzzy(t, anchor.Position, blue.Position)
+		expectFuzzy(t, anchor.LookVector, blue.LookVector)
+	end)
+
+	t.test("solveMove curve: reaching backwards stays clamped rather than swapping", function()
+		-- Behind the fixed end is unreachable for a quarter corner either way
+		-- round, so it must clamp instead of turning the road inside out
+		local seg = makeSegment("Curve", Vector3.new(120, 0, 120), CFrame.identity)
+		local blue = RoadMath.getEndpoint(seg, "Blue").WorldCFrame
+		local solution = RoadMath.solveMove(seg, "Red", Vector3.new(60, 0, -200))
+		t.expect(solution.SwapEnds).toBe(false)
+		t.expect(solution.Size.Z >= WIDTH).toBe(true)
+		local newSeg = makeSegment("Curve", solution.Size, solution.Pivot, solution.Flip)
+		expectFuzzy(t, RoadMath.getEndpoint(newSeg, "Blue").WorldCFrame.Position, blue.Position)
+	end)
+
 	--
 	-- Joints
 	--

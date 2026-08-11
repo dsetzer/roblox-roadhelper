@@ -606,8 +606,10 @@ local function createRoadSession(plugin: Plugin)
 	local function applySolution(model: Model, solution: RoadMath.MoveSolution)
 		local wasFlipped = model:GetAttribute("Flip") == true
 		if solution.SwapEnds then
-			-- The segment was rotated 180 degrees and its ends traded roles:
-			-- move the adjust values to follow their geographic ends.
+			-- The segment was rotated (half a turn to drop a straight's dragged
+			-- end below the other, a quarter to bend a curve the other way) and
+			-- its ends traded roles: move the adjust values to follow their
+			-- geographic ends.
 			local swapped = RoadMath.swappedAdjustValues(function(name: string)
 				local value = model:GetAttribute(name)
 				return if typeof(value) == "number" then value else 0
