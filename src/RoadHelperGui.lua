@@ -481,7 +481,7 @@ local function TaperPanel(props: {
 		LengthInput = if tapered
 			then e(HelpGui.WithHelpIcon, {
 				Help = e(HelpGui.BasicTooltip, {
-					HelpRichText = "How far back from this end the transition runs. The rest of the segment stays at its own width. Drag the yellow bar on the road to set it in the viewport.",
+					HelpRichText = "How far back from this end the transition runs. The rest of the segment stays at its own width. Drag the double-headed arrow on the road to set it in the viewport.",
 				}),
 				LayoutOrder = nextOrder(),
 				Subject = e(NumberInput, {

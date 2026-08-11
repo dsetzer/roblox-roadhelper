@@ -7,9 +7,10 @@
 	  tapers whichever of its ends are joined to neighbours back to those
 	  neighbours, so changing a road's width doesn't drag the rest of the road
 	  along with it.
-	- A length handle sits on the centreline where the end's taper finishes.
-	  Dragging it back and forth along the road sets how long that transition
-	  runs. It only appears on an end which actually tapers.
+	- The length handle is the double-headed arrow on the centreline where the
+	  end's taper finishes. Dragging it back and forth along the road sets how
+	  long that transition runs. It only appears on an end which actually
+	  tapers, and is coloured apart from the width handles.
 ]]
 
 local Packages = script.Parent.Parent.Parent.Packages
@@ -28,8 +29,11 @@ local HIT_RADIUS = 1.5
 local WIDTH_OUTSET = 1.6
 local MARKER_SIZE = 1.4
 
-local WIDTH_COLOR = Color3.fromRGB(120, 220, 160)
-local LENGTH_COLOR = Color3.fromRGB(255, 200, 40)
+-- Colours nothing else in the tool uses: the add handles are white/yellow/blue
+-- and the move and rotate handles take the axis colours, so these two read as
+-- their own pair rather than as more of either
+local WIDTH_COLOR = Color3.fromRGB(90, 215, 205)
+local LENGTH_COLOR = Color3.fromRGB(205, 130, 255)
 
 local TaperHandles = {}
 TaperHandles.__index = TaperHandles
@@ -146,17 +150,22 @@ function TaperHandles:render(hoveredHandleId)
 				ZIndex = 0,
 			})
 		else
-			-- A bar laid across the road marking where the taper finishes
-			children[handleId] = Roact.createElement("BoxHandleAdornment", {
-				Adornee = workspace.Terrain,
-				CFrame = CFrame.lookAlong(handle.Position, handle.Axis),
-				Size = Vector3.new(size * 3.5, size * 0.4, size * 0.9),
-				Color3 = handle.Color,
-				Transparency = if hovered then 0 else 0.3,
-				AlwaysOnTop = false,
-				Shading = Enum.AdornShading.XRay,
-				ZIndex = 0,
-			})
+			-- A double-headed arrow lying along the road: it slides both ways,
+			-- which a plain bar didn't say. Two cones nose to nose rather than
+			-- the add handles' single outward one.
+			for index, direction in { handle.Axis, -handle.Axis } do
+				children[handleId .. index] = Roact.createElement("ConeHandleAdornment", {
+					Adornee = workspace.Terrain,
+					CFrame = CFrame.lookAlong(handle.Position, direction),
+					Height = size * 1.3,
+					Radius = size * 0.45,
+					Color3 = handle.Color,
+					Transparency = if hovered then 0 else 0.3,
+					AlwaysOnTop = false,
+					Shading = Enum.AdornShading.XRay,
+					ZIndex = 0,
+				})
+			end
 		end
 	end
 	return Roact.createElement("Folder", {}, children)
