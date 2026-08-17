@@ -148,12 +148,6 @@ local Generator: GeneratorModuleDefinition<typeof(defaultAttributes)> = {
 		-- The bounding box has to fit the widest cross-section anywhere
 		local maxWidth = math.max(width, blueWidth, redWidth)
 
-		-- Markings follow the widest lane structure: that is the one which has
-		-- to survive, and lanes a narrowing road edge catches up with pinch out
-		-- along the way.
-		local markingLanes = math.max(numLanes, blueNumLanes, redNumLanes)
-		local isCenterLaneDrawn = markingLanes % 2 ~= 0
-
 		local roadLength = size.Z
 
 		--[[
@@ -515,7 +509,7 @@ local Generator: GeneratorModuleDefinition<typeof(defaultAttributes)> = {
 			Draw the actual road
 		--]]
 		-- Build a sorted list of every lane marking: its lateral position and color.
-		-- Edge markings are always present; the rest depend on lane count parity.
+		-- Edge markings are always present and always ride the roadway edge.
 		-- Positions are functions of the fraction along the road so that they
 		-- follow a tapering cross-section; on an untapered road every one of
 		-- them is constant.
@@ -524,57 +518,100 @@ local Generator: GeneratorModuleDefinition<typeof(defaultAttributes)> = {
 			{ latAt = edgeLineAt, color = laneMarkingColor },
 		}
 
-		if not isCenterLaneDrawn then
-			-- Even lane count: a lane boundary sits on the centreline, so opposing traffic is
-			-- split by the double-yellow center lines; interior boundaries get dotted dividers.
-			local half = markingLanes / 2
+		--[[
+			The rest depend on the lane layout, which a taper may CHANGE rather
+			than merely rescale: the number of dividers differs, and an odd count
+			draws a shared centre lane where an even one draws a divided
+			centreline. One set stretched along the whole road therefore can't
+			serve both, so each end and the road's own layout get their own set
+			and the sets are matched slot by slot from the centreline outwards.
+			Each marking then sweeps from one layout's position to the other's
+			across the taper window, which is what lets a tapered end line up
+			with the neighbour it was matched to instead of carrying the road's
+			own layout to the joint and stopping dead against it.
 
-			for i = 1, half - 1 do
-				table.insert(laneMarkings, {
-					latAt = function(u) return -i * laneWidthAt(u) end,
-					color = laneMarkingColor,
-					isDotted = true,
-				})
-				table.insert(laneMarkings, {
-					latAt = function(u) return i * laneWidthAt(u) end,
-					color = laneMarkingColor,
-					isDotted = true,
-				})
+			Slots on each side, innermost first: the solid centreline marking,
+			the dotted inner bound of a shared centre lane (odd counts only),
+			then the lane dividers outwards.
+		--]]
+		local function laneSlots(lanes, lw)
+			local slots: { Centre: number?, Companion: number?, Dividers: { number } } = { Dividers = {} }
+			if lanes < 2 then
+				-- A single lane has no centreline to draw and nothing to divide
+				return slots
 			end
-			table.insert(laneMarkings, { latAt = function() return -CENTER_OFFSET end, color = centerlineColor })
-			table.insert(laneMarkings, { latAt = function() return CENTER_OFFSET end, color = centerlineColor })
-		else
-			-- Odd lane count: a shared center lane straddles lat = 0, bounded by yellow lines
-			local markingsOnEachSide = (markingLanes - 1) / 2
-
-			for _, sign in { -1, 1 } do
-				for i = 1, markingsOnEachSide do
-					local function latAt(u)
-						return (i - 0.5) * laneWidthAt(u) * sign
-					end
-					if i == 1 then
-						table.insert(laneMarkings, {
-							latAt = function(u) return latAt(u) - (1 * sign) end,
-							color = centerlineColor,
-							isDotted = true,
-							dotOffset = 4,
-							skipAsphaltBoundary = true,
-						})
-						table.insert(laneMarkings, {
-							latAt = latAt,
-							color = centerlineColor,
-						})
-					else
-						table.insert(laneMarkings, {
-							latAt = latAt,
-							color = laneMarkingColor,
-							isDotted = true,
-						})
-					end
+			if lanes % 2 == 0 then
+				-- A lane boundary sits on the centreline, so opposing traffic is
+				-- split by the double-yellow center lines
+				slots.Centre = CENTER_OFFSET
+				for i = 1, lanes / 2 - 1 do
+					table.insert(slots.Dividers, i * lw)
+				end
+			else
+				-- A shared center lane straddles lat = 0, bounded by yellow lines
+				slots.Centre = 0.5 * lw
+				slots.Companion = 0.5 * lw - 1
+				for i = 2, (lanes - 1) / 2 do
+					table.insert(slots.Dividers, (i - 0.5) * lw)
 				end
 			end
+			return slots
+		end
+		local baseSlots = laneSlots(numLanes, laneWidth)
+		local blueSlots = laneSlots(blueNumLanes, blueLaneWidth)
+		local redSlots = laneSlots(redNumLanes, redLaneWidth)
+
+		-- A layout with no counterpart for a slot parks that marking just past
+		-- its own roadway edge, where the pinch-out below clips it: the lane
+		-- merges away into the shoulder instead of stopping in traffic.
+		local baseEdge = halfWidth - sidewalkWidth - EDGE_INSET + 0.05
+		local blueEdge = blueHalfWidth - blueSidewalk - EDGE_INSET + 0.05
+		local redEdge = redHalfWidth - redSidewalk - EDGE_INSET + 0.05
+
+		local function slotMarking(sign, base, blue, red, color, isDotted, dotOffset, skipAsphaltBoundary)
+			local b, bl, rd = base or baseEdge, blue or blueEdge, red or redEdge
+			return {
+				latAt = function(u)
+					return sign * crossAt(u, b, bl, rd)
+				end,
+				color = color,
+				isDotted = isDotted,
+				dotOffset = dotOffset,
+				skipAsphaltBoundary = skipAsphaltBoundary,
+			}
 		end
 
+		local dividerCount = math.max(#baseSlots.Dividers, #blueSlots.Dividers, #redSlots.Dividers)
+		for _, sign in { -1, 1 } do
+			if baseSlots.Centre or blueSlots.Centre or redSlots.Centre then
+				table.insert(laneMarkings, slotMarking(
+					sign, baseSlots.Centre, blueSlots.Centre, redSlots.Centre,
+					centerlineColor, false, 0, false))
+			end
+			-- The centre lane's inner line has nowhere to go in a layout without
+			-- one, so rather than sweep it out across the road it simply stops
+			-- partway, the way a centre turn lane's does where the lane ends.
+			if baseSlots.Companion or blueSlots.Companion or redSlots.Companion then
+				local marking = slotMarking(
+					sign,
+					baseSlots.Companion or baseSlots.Centre,
+					blueSlots.Companion or blueSlots.Centre,
+					redSlots.Companion or redSlots.Centre,
+					centerlineColor, true, 4, true)
+				local basePresent = if baseSlots.Companion then 1 else 0
+				local bluePresent = if blueSlots.Companion then 1 else 0
+				local redPresent = if redSlots.Companion then 1 else 0
+				marking.activeAt = function(u)
+					return crossAt(u, basePresent, bluePresent, redPresent) > 0.5
+				end
+				table.insert(laneMarkings, marking)
+			end
+			for i = 1, dividerCount do
+				table.insert(laneMarkings, slotMarking(
+					sign, baseSlots.Dividers[i], blueSlots.Dividers[i], redSlots.Dividers[i],
+					laneMarkingColor, true, 0, false))
+			end
+		end
 		-- Ordering is taken at the blue end; the per-slice evaluation below
 		-- keeps the boundaries monotonic wherever a taper would reorder them.
 		table.sort(laneMarkings, function(a, b)
@@ -742,6 +779,11 @@ local Generator: GeneratorModuleDefinition<typeof(defaultAttributes)> = {
 				if isTapered
 					and (math.abs(latA) > edgeLineAt(ua) + 0.01 or math.abs(latB) > edgeLineAt(ub) + 0.01)
 				then
+					continue
+				end
+				-- A marking belonging to a layout this stretch of road has
+				-- tapered away from stops here rather than being dragged along
+				if marking.activeAt and not (marking.activeAt(ua) and marking.activeAt(ub)) then
 					continue
 				end
 				local pa = sliceCFrames[i] * Vector3.new(latA, hRoadTop + 0.05, 0)
