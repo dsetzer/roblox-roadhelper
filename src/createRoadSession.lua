@@ -890,14 +890,20 @@ local function createRoadSession(plugin: Plugin)
 		if not info or info.Kind == "Intersection" then
 			return
 		end
-		-- Neighbours are read before the change, so the tapers target the
-		-- widths they had rather than anything we have just written
+		-- Neighbours are read before the change, and against their OWN width
+		-- rather than the width they happen to present at the joint right
+		-- now. That presented width may be a taper THIS segment asked for the
+		-- last time it was resized, and chasing it again is what makes a road
+		-- widened a segment at a time come out lumpy: each segment keeps
+		-- pinching back to the stale narrow end of the one before it.
+		local partners: { [string]: RoadMath.Endpoint } = {}
 		local neighbours: { [string]: RoadMath.LaneLayout } = {}
 		for _, id in { "Blue", "Red" } do
 			local endpoint = RoadMath.getEndpoint(info, id :: RoadMath.EndpointId)
 			local partner = partnerOfEndpoint(endpoint)
 			if partner then
-				neighbours[id] = RoadMath.endLayout(partner.Segment, partner.Id)
+				partners[id] = partner
+				neighbours[id] = RoadMath.baseLayout(partner.Segment, partner.Id)
 			end
 		end
 
@@ -925,6 +931,19 @@ local function createRoadSession(plugin: Plugin)
 		);
 		(model :: any).Size = solution.Size
 		model:PivotTo(solution.Pivot)
+
+		-- The transition lives on THIS segment now, so a taper the neighbour
+		-- is still carrying at the shared end is left over from a previous
+		-- resize: drop it so the joint meets at the width the two actually
+		-- share. Widening along a road then leaves one taper, at the front of
+		-- the run, instead of one per segment.
+		for _, partner in partners do
+			applyEndLayout(
+				partner.Segment.Model,
+				partner.Id,
+				RoadMath.baseLayout(partner.Segment, partner.Id)
+			)
+		end
 	end
 
 	-- Taper a road end to the neighbour it has just been joined to. The
