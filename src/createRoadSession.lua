@@ -653,17 +653,21 @@ local function createRoadSession(plugin: Plugin)
 	-- Apply a move solution and keep endpoint references coherent: a SwapEnds
 	-- solution re-colors the segment's ends, so any refs we hold pointing at
 	-- them (the drag target itself and possibly the selection) must flip too.
-	local function applySolutionToRef(ref: EndpointRef, solution: RoadMath.MoveSolution)
+	-- Returns whether the ends were swapped, so a caller holding attributes it
+	-- captured by end color can trade those over as well.
+	local function applySolutionToRef(ref: EndpointRef, solution: RoadMath.MoveSolution): boolean
 		applySolution(ref.Model, solution)
-		if solution.SwapEnds then
-			local newId: RoadMath.EndpointId = if ref.Id == "Blue" then "Red" else "Blue"
-			local selected = selectedRef
-			if selected and selected ~= ref and selected.Model == ref.Model and selected.Id == ref.Id then
-				selected.Id = newId
-			end
-			ref.Id = newId
-			changeSignal:Fire()
+		if not solution.SwapEnds then
+			return false
 		end
+		local newId: RoadMath.EndpointId = if ref.Id == "Blue" then "Red" else "Blue"
+		local selected = selectedRef
+		if selected and selected ~= ref and selected.Model == ref.Model and selected.Id == ref.Id then
+			selected.Id = newId
+		end
+		ref.Id = newId
+		changeSignal:Fire()
+		return true
 	end
 
 	local function setAdjustAttribute(model: Model, id: RoadMath.EndpointId, axis: RoadMath.AdjustAxis, value: number)
@@ -855,6 +859,42 @@ local function createRoadSession(plugin: Plugin)
 			end
 		end
 		return captured
+	end
+
+	--[[
+		A drag holds the attributes it captured at the start and re-applies them
+		on every frame, but they are keyed by end COLOR and a SwapEnds solution
+		re-colors the ends midway through. Trade the capture over with them, or
+		the next frame puts the taper back on the end it just left -- and since
+		the end widths feed the move solve, that can leave the segment swapping
+		back and forth for the rest of the drag.
+	]]
+	local function swapCapturedTaper(captured: { [string]: any }?): { [string]: any }?
+		if not captured then
+			return nil
+		end
+		local swapped: { [string]: any } = {}
+		for _, pair in { { "TaperBlue", "TaperRed" }, { "TaperRed", "TaperBlue" } } do
+			local from, to = pair[1], pair[2]
+			swapped[to] = captured[from]
+			for _, suffix in { "LaneCount", "LaneWidth", "SidewalkWidth", "Length" } do
+				swapped[to .. suffix] = captured[from .. suffix]
+			end
+		end
+		return swapped
+	end
+
+	-- The same for a captured endpoint's adjust values. The end stays where it
+	-- is and only changes color, but grade and bank are read against the travel
+	-- direction through the end, which the color change reverses (the same
+	-- rule swappedAdjustValues applies to the attributes themselves).
+	local function swapCapturedAdjust(
+		captured: { [RoadMath.AdjustAxis]: number }?
+	): { [RoadMath.AdjustAxis]: number }?
+		if not captured then
+			return nil
+		end
+		return { Dir = captured.Dir, Grade = -captured.Grade, Bank = -captured.Bank }
 	end
 
 	-- Rebuild one end of a road to `layout`, compensating the bounds so both
@@ -1097,11 +1137,17 @@ local function createRoadSession(plugin: Plugin)
 				setLayoutAttributes(dragTarget.Model, moveOriginalTaper)
 			end
 		end
-		for _, target in moveTargets do
+		for index, target in moveTargets do
 			local info = RoadMath.getSegmentInfo(target.Model)
 			if info then
 				local ok, err = pcall(function()
-					applySolutionToRef(target, RoadMath.solveMove(info, target.Id, newWorldPosition))
+					local swapped = applySolutionToRef(target, RoadMath.solveMove(info, target.Id, newWorldPosition))
+					-- Only the first target is the dragged end, and only its
+					-- attributes were captured above
+					if swapped and index == 1 then
+						moveOriginalTaper = swapCapturedTaper(moveOriginalTaper)
+						moveOriginalAdjust = swapCapturedAdjust(moveOriginalAdjust)
+					end
 				end)
 				if not ok then
 					warn("RoadHelper: Endpoint move failed: " .. tostring(err))
@@ -1473,7 +1519,10 @@ local function createRoadSession(plugin: Plugin)
 		local info = RoadMath.getSegmentInfo(ref.Model)
 		if info then
 			local ok, err = pcall(function()
-				applySolutionToRef(ref, RoadMath.solveMove(info, ref.Id, worldPosition))
+				if applySolutionToRef(ref, RoadMath.solveMove(info, ref.Id, worldPosition)) then
+					addDragOriginalTaper = swapCapturedTaper(addDragOriginalTaper)
+					addDragOriginalAdjust = swapCapturedAdjust(addDragOriginalAdjust)
+				end
 			end)
 			if not ok then
 				warn("RoadHelper: Segment placement failed: " .. tostring(err))
